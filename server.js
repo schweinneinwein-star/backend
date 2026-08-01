@@ -888,8 +888,9 @@ socket.on('update_profile', (data) => {
 
     // Robust 'send_message' handler (accepts partial payloads and always emits)
     socket.on('send_message', async (data) => {
-        console.log('📩 Сервер получил сообщение:', data);
+        console.log('🔵 3. [SERVER] Сокет получил данные от клиента:', data);
         try {
+            console.log('🔵 4. [SERVER] Пытаюсь сохранить в MongoDB...');
             const createdMessage = await Message.create({
                 text: data.text || '',
                 sender: data.sender || 'Anonymous',
@@ -903,10 +904,10 @@ socket.on('update_profile', (data) => {
                 timestamp: data.timestamp ? new Date(data.timestamp) : new Date(),
                 read: typeof data.read === 'boolean' ? data.read : false,
             });
-            console.log('💾 УСПЕШНО СОХРАНЕНО В MONGO:', createdMessage._id);
+            console.log('✅ 5. [SERVER] УСПЕХ! Сохранено в БД:', createdMessage);
             io.emit('receive_message', createdMessage);
         } catch (err) {
-            console.error('❌ Ошибка сохранения в Mongo:', err && err.message ? err.message : err);
+            console.error('❌ 6. [SERVER] ОШИБКА БАЗЫ ДАННЫХ:', err && err.message ? err.message : err);
             try {
                 io.emit('receive_message', data);
             } catch (emitErr) {
