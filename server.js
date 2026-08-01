@@ -57,8 +57,8 @@ mongoose.connect(MONGO_URI, {
 
 // Define Mongoose schemas and models
 const messageSchema = new mongoose.Schema({
-    text: { type: String, default: '' },
-    sender: { type: String, required: true },
+    text: { type: String, required: true },
+    sender: { type: String, default: null },
     recipient: { type: String, default: null },
     roomId: { type: String, default: null },
     type: { type: String, default: 'text' },
@@ -878,6 +878,32 @@ socket.on('update_profile', (data) => {
 
             socket.emit('new_private_message', newMsg);
             broadcastChatList(socket.phone);
+        }
+    });
+
+    // Robust 'send_message' handler (accepts partial payloads and always emits)
+    socket.on('send_message', async (data) => {
+        try {
+            console.log('📥 ПРИШЕЛ ЗАПРОС НА СООБЩЕНИЕ:', JSON.stringify(data));
+
+            // Пробуем сохранить в БД
+            const newMessage = await Message.create(data);
+            console.log('✅ СООБЩЕНИЕ УСПЕШНО СОХРАНЕНО В MONGODB:', newMessage);
+
+            // Отправляем всем клиентам
+            io.emit('receive_message', newMessage);
+            console.log('✅ Разослано клиентам!');
+
+        } catch (error) {
+            console.error('❌ ОШИБКА БАЗЫ ДАННЫХ (Mongoose):', error && error.message ? error.message : error);
+            
+            // СПАСАТЕЛЬНЫЙ КРУГ: даже если БД упала, всё равно рассылаем сообщение в чат!
+            try {
+                console.log('⚠️ Отправляю в чат без сохранения в базу...');
+                io.emit('receive_message', data);
+            } catch (emitErr) {
+                console.error('❌ Ошибка при попытке рассыла сообщения в качестве fallback:', emitErr);
+            }
         }
     });
 
