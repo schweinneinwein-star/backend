@@ -788,115 +788,97 @@ socket.on('update_profile', (data) => {
 
     socket.on('send_private_message', async (data) => {
         console.log('📥 send_private_message invoked. socket.id=', socket.id, 'socket.phone=', socket.phone, 'payload=', JSON.stringify(data));
-        if (!socket.phone || !data.recipientPhone) {
-            console.warn('❗ send_private_message rejected: missing socket.phone or recipientPhone', { socketPhone: socket.phone, recipientPhone: data && data.recipientPhone });
-            // If client provided sender in payload, attempt to proceed (heuristic)
-            if (!(data && data.sender) || !(data && data.recipientPhone)) return;
+        if (!socket.phone && !(data && data.sender)) {
+            console.warn('❗ send_private_message rejected: missing socket.phone and payload.sender', { socketPhone: socket.phone, payload: data });
+            return;
         }
-        
-        // У обычных сообщений есть текст, у логов звонков и стикеров текста может не быть
-        if (!data.text && !data.mediaBase64 && data.type !== 'call_log' && data.type !== 'sticker') return;
 
-        const users = loadUsers();
-        const senderUser = users.find(u => u.phone === socket.phone);
-        const targetUser = users.find(u => u.phone === data.recipientPhone);
-        const senderBlockedTarget = !!(senderUser && Array.isArray(senderUser.blockedUsers) && senderUser.blockedUsers.includes(data.recipientPhone));
-        const targetBlockedSender = !!(targetUser && Array.isArray(targetUser.blockedBy) && targetUser.blockedBy.includes(socket.phone));
-        if (senderBlockedTarget || targetBlockedSender) {
-            socket.emit('chat_blocked', { targetPhone: data.recipientPhone, by: senderBlockedTarget ? socket.phone : data.recipientPhone });
+        if (!data || (!data.text && !data.mediaBase64 && data.type !== 'call_log' && data.type !== 'sticker')) {
+            return;
+        }
+
+        const senderPhone = socket.phone || data.sender;
+        const recipientPhone = data.recipientPhone || data.recipient || data.roomId;
+        if (!recipientPhone) {
+            console.warn('❗ send_private_message rejected: missing recipientPhone', data);
             return;
         }
 
         console.log('🔥 СОКЕТ ПРИНЯЛ СООБЩЕНИЕ:', data);
 
-        const messages = loadMessages();
         let mediaUrl = null;
         if (data.mediaBase64) {
-            mediaUrl = saveBase64Image(data.mediaBase64, socket.phone, `chat_${Date.now()}`);
+            mediaUrl = saveBase64Image(data.mediaBase64, senderPhone, `chat_${Date.now()}`);
             if (!mediaUrl) return;
         }
-        
+
         const newMsg = {
-            sender: socket.phone,
-            recipient: data.recipientPhone,
-            text: data.text ? data.text.trim() : '',
-            type: data.type || 'text',              // 'text', 'call_log', 'sticker', 'media'
-            callStatus: data.callStatus || null,    // 'success' или 'canceled'
-            duration: data.duration || null,        // Время разговора
-            stickerUrl: data.stickerUrl || null,    // Путь к стикеру
-            stickerName: data.stickerName || null,  // Имя файла стикера
-            packName: data.packName || null,        // Название пакета
-            timestamp: Date.now(),
-            mediaUrl: mediaUrl,
+            text: data.text ? String(data.text).trim() : '',
+            sender: senderPhone,
+            recipient: recipientPhone,
+            roomId: recipientPhone,
+            type: data.type || 'text',
+            callStatus: data.callStatus || null,
+            duration: data.duration || null,
+            stickerUrl: data.stickerUrl || null,
+            stickerName: data.stickerName || null,
+            packName: data.packName || null,
+            mediaUrl,
             isVideo: !!data.isVideo,
-            read: false
+            timestamp: data.timestamp ? new Date(data.timestamp) : new Date(),
+            read: false,
         };
 
-        // Try to save to MongoDB first
         try {
-            const saved = await Message.create({
-                text: newMsg.text,
-                sender: newMsg.sender,
-                recipient: newMsg.recipient,
-                roomId: null,
-                type: newMsg.type,
-                mediaUrl: newMsg.mediaUrl,
-                isVideo: newMsg.isVideo,
-                stickerUrl: newMsg.stickerUrl,
-                stickerName: newMsg.stickerName,
-                packName: newMsg.packName,
-                timestamp: new Date(newMsg.timestamp),
-                read: false
-            });
-
-            // update in-memory cache and persist to file as a best-effort backup
+            console.log('🔵 4. [SERVER] Пытаюсь сохранить send_private_message в MongoDB...');
+            const saved = await Message.create(newMsg);
             messagesCache.push(saved);
             saveMessages(messagesCache);
 
-            const recipientSocketId = onlineUsers[data.recipientPhone];
+            const recipientSocketId = onlineUsers[recipientPhone];
             if (recipientSocketId) {
                 io.to(recipientSocketId).emit('new_private_message', saved);
-                broadcastChatList(data.recipientPhone);
+                broadcastChatList(recipientPhone);
             }
 
             socket.emit('new_private_message', saved);
-            broadcastChatList(socket.phone);
+            broadcastChatList(senderPhone);
         } catch (err) {
-            console.error('❌ Ошибка сохранения сообщения в MongoDB:', err);
-            // Fallback to file-based store
-            messages.push(newMsg);
-            saveMessages(messages);
-
-            const recipientSocketId = onlineUsers[data.recipientPhone];
-            if (recipientSocketId) {
-                io.to(recipientSocketId).emit('new_private_message', newMsg);
-                broadcastChatList(data.recipientPhone);
+            console.error('❌ Ошибка сохранения send_private_message в MongoDB:', err);
+            try {
+                const recipientSocketId = onlineUsers[recipientPhone];
+                if (recipientSocketId) {
+                    io.to(recipientSocketId).emit('new_private_message', newMsg);
+                    broadcastChatList(recipientPhone);
+                }
+                socket.emit('new_private_message', newMsg);
+                broadcastChatList(senderPhone);
+            } catch (emitErr) {
+                console.error('❌ Ошибка отправки fallback send_private_message:', emitErr);
             }
-
-            socket.emit('new_private_message', newMsg);
-            broadcastChatList(socket.phone);
         }
     });
 
     // Robust 'send_message' handler (accepts partial payloads and always emits)
     socket.on('send_message', async (data) => {
+        console.log('💻 [СЕРВЕР] Сокет поймал сообщение от клиента:', data);
         console.log('🔥 УРА! СЕРВЕР ПОЛУЧИЛ СООБЩЕНИЕ ОТ ТЕЛЕФОНА:', data);
         try {
             console.log('🔵 4. [SERVER] Пытаюсь сохранить в MongoDB...');
             const createdMessage = await Message.create({
-                text: data.text || '',
-                sender: data.sender || 'Anonymous',
-                roomId: data.roomId || (data.recipientPhone ? String(data.recipientPhone) : 'general'),
+                text: data.text ? String(data.text) : '',
+                sender: data.sender || data.username || null,
                 recipient: data.recipientPhone || data.recipient || null,
+                roomId: data.roomId || data.recipientPhone || data.recipient || null,
                 type: data.type || 'text',
                 mediaUrl: data.mediaUrl || null,
                 stickerUrl: data.stickerUrl || null,
                 stickerName: data.stickerName || null,
                 packName: data.packName || null,
                 timestamp: data.timestamp ? new Date(data.timestamp) : new Date(),
-                read: typeof data.read === 'boolean' ? data.read : false,
+                read: data.read || false,
             });
-            console.log('✅ 5. [SERVER] УСПЕХ! Сохранено в БД:', createdMessage);
+            console.log('✅ 5. [SERVER] УСПЕШНО СОХРАНЕНО В БАЗУ!', createdMessage);
             io.emit('receive_message', createdMessage);
         } catch (err) {
             console.error('❌ 6. [SERVER] ОШИБКА БАЗЫ ДАННЫХ:', err && err.message ? err.message : err);
