@@ -1,4 +1,5 @@
 const express = require('express');
+const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
@@ -20,7 +21,13 @@ const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-    maxHttpBufferSize: 1e8 
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST', 'PUT', 'DELETE'],
+        credentials: true,
+    },
+    transports: ['websocket', 'polling'],
+    maxHttpBufferSize: 1e8,
 });
 
 const DB_FILE = path.join(__dirname, 'users.json');
@@ -40,7 +47,20 @@ function loadPosts() {
 }
 function savePosts(posts) { fs.writeFileSync(POSTS_FILE, JSON.stringify(posts, null, 2)); }
 
+app.use(
+    cors({
+        origin: '*',
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        credentials: true,
+    }),
+);
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+app.get('/', (req, res) => {
+    res.json({ status: 'ok', message: 'Sparkle Server is running live!' });
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/stickerpacks', express.static(path.join(__dirname, 'stickerpacks')));
@@ -1243,8 +1263,8 @@ app.post('/api/chat/delete-both', (req, res) => {
     res.json({ success: true });
 });
 
-const PORT = 3000;
-server.listen(PORT, () => console.log(`🚀 Сервер запущен на http://localhost:${PORT}`));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Сервер запущен на http://0.0.0.0:${PORT}`));
 
 function saveBase64ToDir(base64Data, targetDir, fileName) {
     try {
