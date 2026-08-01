@@ -20,6 +20,9 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 const app = express();
 const server = http.createServer(app);
 
+const COMMENTS_FILE = path.join(__dirname, 'comments.json');
+const POSTS_FILE = path.join(__dirname, 'posts.json');
+
 const io = new Server(server, {
     cors: {
         origin: '*',
@@ -29,13 +32,6 @@ const io = new Server(server, {
     maxHttpBufferSize: 1e8,
 });
 
-const DB_FILE = path.join(__dirname, 'users.json');
-const MSG_FILE = path.join(__dirname, 'messages.json');
-const COMMENTS_FILE = path.join(__dirname, 'comments.json');
-const POSTS_FILE = path.join(__dirname, 'posts.json');
-
-// Promises API for async reads/writes
-const fsPromises = fs.promises;
 let usersCache = [];
 let messagesCache = [];
 
@@ -50,6 +46,8 @@ const MONGO_URI = process.env.MONGO_URI || `mongodb+srv://sparklemms_db_user:${e
         const uri = process.env.MONGO_URI || MONGO_URI;
         await mongoose.connect(uri);
         console.log('✅ MongoDB connected');
+
+        await initCaches();
     } catch (err) {
         console.error('❌ MongoDB connection error:', err);
     }
@@ -77,50 +75,74 @@ const groupSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
+const userSchema = new mongoose.Schema({
+    phone: { type: String, required: true, unique: true },
+    firstName: { type: String, default: null },
+    lastName: { type: String, default: null },
+    username: { type: String, default: null },
+    bio: { type: String, default: '' },
+    avatarUrl: { type: String, default: null },
+    bannerUrl: { type: String, default: null },
+    joinDate: { type: Date, default: Date.now },
+    lastSeen: { type: Date, default: null },
+    totalReadTime: { type: Number, default: 0 },
+    readMessageCount: { type: Number, default: 0 },
+    hideAnswerTime: { type: Boolean, default: false },
+    votes: { type: Number, default: 0 },
+    blockedUsers: { type: [String], default: [] },
+    blockedBy: { type: [String], default: [] },
+    stickerCollection: { type: [String], default: [] },
+    sessionToken: { type: String, default: null },
+    sessions: { type: Array, default: [] },
+    active: { type: Boolean, default: true },
+}, { timestamps: true });
+
 const Message = mongoose.models.Message || mongoose.model('Message', messageSchema);
 const Group = mongoose.models.Group || mongoose.model('Group', groupSchema);
+const User = mongoose.models.User || mongoose.model('User', userSchema);
 
-// Initialize caches asynchronously and create files if missing
 async function initCaches() {
     try {
-        // Users
-        try {
-            const usersRaw = await fsPromises.readFile(DB_FILE, 'utf8');
-            usersCache = JSON.parse(usersRaw) || [];
-            console.log(`Loaded ${usersCache.length} users from ${DB_FILE}`);
-        } catch (err) {
-            if (err && err.code === 'ENOENT') {
-                usersCache = [];
-                await fsPromises.writeFile(DB_FILE, JSON.stringify(usersCache, null, 2));
-                console.log(`Created missing ${DB_FILE}`);
-            } else {
-                console.error('Failed loading users.json, continuing with empty cache:', err);
-                usersCache = [];
-            }
-        }
-
-        // Messages
-        try {
-            const msgsRaw = await fsPromises.readFile(MSG_FILE, 'utf8');
-            messagesCache = JSON.parse(msgsRaw) || [];
-            console.log(`Loaded ${messagesCache.length} messages from ${MSG_FILE}`);
-        } catch (err) {
-            if (err && err.code === 'ENOENT') {
-                messagesCache = [];
-                await fsPromises.writeFile(MSG_FILE, JSON.stringify(messagesCache, null, 2));
-                console.log(`Created missing ${MSG_FILE}`);
-            } else {
-                console.error('Failed loading messages.json, continuing with empty cache:', err);
-                messagesCache = [];
-            }
-        }
+        usersCache = await User.find({}).lean().exec();
+        messagesCache = await Message.find({}).sort({ timestamp: 1 }).lean().exec();
+        console.log(`Loaded ${usersCache.length} users from MongoDB`);
+        console.log(`Loaded ${messagesCache.length} messages from MongoDB`);
     } catch (err) {
         console.error('initCaches error:', err);
-        usersCache = usersCache || [];
-        messagesCache = messagesCache || [];
+        usersCache = [];
+        messagesCache = [];
     }
 }
-initCaches().catch(err => console.error('initCaches failed:', err));
+
+function loadUsers() {
+    return usersCache || [];
+}
+
+async function saveUsers(users) {
+    usersCache = Array.isArray(users) ? users : [];
+    try {
+        await Promise.all(usersCache.map((user) => {
+            if (!user || !user.phone) return Promise.resolve(null);
+            return User.findOneAndUpdate(
+                { phone: user.phone },
+                { $set: user },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            ).exec();
+        }));
+        console.log(`Saved ${usersCache.length} users to MongoDB`);
+    } catch (err) {
+        console.error('❌ Error saving users to MongoDB:', err);
+    }
+}
+
+function loadMessages() {
+    return messagesCache || [];
+}
+
+function saveMessages(messages) {
+    messagesCache = Array.isArray(messages) ? messages : [];
+    return Promise.resolve();
+}
 
 function loadComments() {
     if (!fs.existsSync(COMMENTS_FILE)) return [];
@@ -167,35 +189,6 @@ function sanitizePackName(name) {
     return safe || 'pack';
 }
 
-function loadUsers() {
-    // Return the in-memory cache. initCaches() populates it at startup and keeps the authoritative copy in memory.
-    return usersCache || [];
-}
-function saveUsers(users) {
-    try {
-        usersCache = users || [];
-        // Persist asynchronously; do not block the event loop. Errors are logged.
-        fsPromises.writeFile(DB_FILE, JSON.stringify(usersCache, null, 2))
-            .then(() => console.log(`Saved ${usersCache.length} users to disk`))
-            .catch(err => console.error('❌ ОШИБКА ЗАПИСИ users.json:', err));
-    } catch (err) {
-        console.error('❌ Ошибка в saveUsers (sync):', err);
-    }
-}
-
-function loadMessages() {
-    return messagesCache || [];
-}
-function saveMessages(messages) {
-    try {
-        messagesCache = messages || [];
-        fsPromises.writeFile(MSG_FILE, JSON.stringify(messagesCache, null, 2))
-            .then(() => console.log(`Saved ${messagesCache.length} messages to disk`))
-            .catch(err => console.error('❌ ОШИБКА ЗАПИСИ messages.json:', err));
-    } catch (err) {
-        console.error('❌ Ошибка в saveMessages (sync):', err);
-    }
-}
 
 function loadUserCollection(phone) {
     const users = loadUsers();
@@ -284,7 +277,6 @@ function removePackFromAllCollections(packName) {
     if (changed) saveUsers(users);
 }
 
-let allRegisteredUsers = loadUsers();
 let onlineUsers = {}; 
 let userChatFocus = {}; 
 
@@ -888,7 +880,7 @@ socket.on('update_profile', (data) => {
 
     // Robust 'send_message' handler (accepts partial payloads and always emits)
     socket.on('send_message', async (data) => {
-        console.log('🔵 3. [SERVER] Сокет получил данные от клиента:', data);
+        console.log('🔥 УРА! СЕРВЕР ПОЛУЧИЛ СООБЩЕНИЕ ОТ ТЕЛЕФОНА:', data);
         try {
             console.log('🔵 4. [SERVER] Пытаюсь сохранить в MongoDB...');
             const createdMessage = await Message.create({
