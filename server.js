@@ -40,6 +40,46 @@ const fsPromises = fs.promises;
 let usersCache = [];
 let messagesCache = [];
 
+// --- MONGOOSE / MongoDB SETUP ---
+const mongoose = require('mongoose');
+// Prefer environment variable MONGO_URI, otherwise use provided credentials
+const MONGO_PASSWORD = process.env.MONGO_PASSWORD || 'e70sTKY6FmcDQpBS';
+const MONGO_URI = process.env.MONGO_URI || `mongodb+srv://sparklemms_db_user:${encodeURIComponent(MONGO_PASSWORD)}@cluster0.hr8pwru.mongodb.net/sparkle?retryWrites=true&w=majority`;
+
+mongoose.connect(MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+}).then(() => {
+    console.log('✅ MongoDB connected');
+}).catch(err => {
+    console.error('❌ MongoDB connection error:', err);
+});
+
+// Define Mongoose schemas and models
+const messageSchema = new mongoose.Schema({
+    text: { type: String, default: '' },
+    sender: { type: String, required: true },
+    recipient: { type: String, default: null },
+    roomId: { type: String, default: null },
+    type: { type: String, default: 'text' },
+    mediaUrl: { type: String, default: null },
+    isVideo: { type: Boolean, default: false },
+    stickerUrl: { type: String, default: null },
+    stickerName: { type: String, default: null },
+    packName: { type: String, default: null },
+    timestamp: { type: Date, default: Date.now },
+    read: { type: Boolean, default: false }
+}, { timestamps: true });
+
+const groupSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    members: { type: [String], default: [] },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const Message = mongoose.models.Message || mongoose.model('Message', messageSchema);
+const Group = mongoose.models.Group || mongoose.model('Group', groupSchema);
+
 // Initialize caches asynchronously and create files if missing
 async function initCaches() {
     try {
@@ -349,6 +389,18 @@ async function getRealGeoData(ip) {
 io.on('connection', (socket) => {
     console.log('🟢 [СИСТЕМА] Новое подключение:', socket.id);
     const clientIp = socket.handshake.address;
+
+    // Send recent messages from MongoDB to the newly connected client (last 50)
+    (async () => {
+        try {
+            const recent = await Message.find({}).sort({ timestamp: -1 }).limit(50).lean();
+            socket.emit('recent_messages', recent.reverse());
+        } catch (err) {
+            console.error('❌ Failed to fetch recent messages from MongoDB:', err);
+            // Fallback to in-memory cache
+            socket.emit('recent_messages', (messagesCache || []).slice(-50));
+        }
+    })();
 
     socket.on('check_session', async (token) => {
         const users = loadUsers();
@@ -715,21 +767,34 @@ socket.on('update_profile', (data) => {
         }
     });
 
-    socket.on('get_chat_history', (data) => {
+    socket.on('get_chat_history', async (data) => {
         if (!socket.phone) return;
-        const messages = loadMessages();
         const myPhone = socket.phone;
         const partnerPhone = data.withPhone;
-        const history = messages.filter(m => 
-            isMessageVisibleForUser(m, myPhone) && (
-                (m.sender === myPhone && m.recipient === partnerPhone) ||
-                (m.sender === partnerPhone && m.recipient === myPhone)
-            )
-        );
-        socket.emit('chat_history', history);
+        try {
+            // Fetch from MongoDB
+            const history = await Message.find({
+                $or: [
+                    { sender: myPhone, recipient: partnerPhone },
+                    { sender: partnerPhone, recipient: myPhone }
+                ]
+            }).sort({ timestamp: 1 }).limit(100).lean();
+            socket.emit('chat_history', history);
+        } catch (err) {
+            console.error('❌ Failed to fetch chat history from MongoDB:', err);
+            // Fallback to file cache
+            const messages = loadMessages();
+            const history = messages.filter(m => 
+                isMessageVisibleForUser(m, myPhone) && (
+                    (m.sender === myPhone && m.recipient === partnerPhone) ||
+                    (m.sender === partnerPhone && m.recipient === myPhone)
+                )
+            );
+            socket.emit('chat_history', history);
+        }
     });
 
-    socket.on('send_private_message', (data) => {
+    socket.on('send_private_message', async (data) => {
         if (!socket.phone || !data.recipientPhone) return;
         
         // У обычных сообщений есть текст, у логов звонков и стикеров текста может не быть
@@ -770,17 +835,66 @@ socket.on('update_profile', (data) => {
             read: false
         };
 
-        messages.push(newMsg);
-        saveMessages(messages);
+        // Try to save to MongoDB first
+        try {
+            const saved = await Message.create({
+                text: newMsg.text,
+                sender: newMsg.sender,
+                recipient: newMsg.recipient,
+                roomId: null,
+                type: newMsg.type,
+                mediaUrl: newMsg.mediaUrl,
+                isVideo: newMsg.isVideo,
+                stickerUrl: newMsg.stickerUrl,
+                stickerName: newMsg.stickerName,
+                packName: newMsg.packName,
+                timestamp: new Date(newMsg.timestamp),
+                read: false
+            });
 
-        const recipientSocketId = onlineUsers[data.recipientPhone];
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('new_private_message', newMsg);
-            broadcastChatList(data.recipientPhone);
+            // update in-memory cache and persist to file as a best-effort backup
+            messagesCache.push(saved);
+            saveMessages(messagesCache);
+
+            const recipientSocketId = onlineUsers[data.recipientPhone];
+            if (recipientSocketId) {
+                io.to(recipientSocketId).emit('new_private_message', saved);
+                broadcastChatList(data.recipientPhone);
+            }
+
+            socket.emit('new_private_message', saved);
+            broadcastChatList(socket.phone);
+        } catch (err) {
+            console.error('❌ Ошибка сохранения сообщения в MongoDB:', err);
+            // Fallback to file-based store
+            messages.push(newMsg);
+            saveMessages(messages);
+
+            const recipientSocketId = onlineUsers[data.recipientPhone];
+            if (recipientSocketId) {
+                io.to(recipientSocketId).emit('new_private_message', newMsg);
+                broadcastChatList(data.recipientPhone);
+            }
+
+            socket.emit('new_private_message', newMsg);
+            broadcastChatList(socket.phone);
         }
+    });
 
-        socket.emit('new_private_message', newMsg);
-        broadcastChatList(socket.phone);
+    // Group creation via socket
+    socket.on('create_group', async (data) => {
+        if (!socket.phone) return socket.emit('group_creation_error', 'Not authenticated');
+        const { name, members } = data || {};
+        if (!name || !Array.isArray(members)) return socket.emit('group_creation_error', 'Invalid group payload');
+        try {
+            const group = await Group.create({ name: name.toString().trim(), members, createdAt: new Date() });
+            // Optionally: update user records to reference group (not implemented)
+            io.emit('group_created', group);
+            socket.emit('group_created', group);
+        } catch (err) {
+            console.error('❌ Failed to create group in MongoDB:', err);
+            socket.emit('group_creation_error', err.message || 'Failed to create group');
+        }
     });
 
     socket.on('search_user', (data) => {
