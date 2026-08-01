@@ -35,6 +35,53 @@ const MSG_FILE = path.join(__dirname, 'messages.json');
 const COMMENTS_FILE = path.join(__dirname, 'comments.json');
 const POSTS_FILE = path.join(__dirname, 'posts.json');
 
+// Promises API for async reads/writes
+const fsPromises = fs.promises;
+let usersCache = [];
+let messagesCache = [];
+
+// Initialize caches asynchronously and create files if missing
+async function initCaches() {
+    try {
+        // Users
+        try {
+            const usersRaw = await fsPromises.readFile(DB_FILE, 'utf8');
+            usersCache = JSON.parse(usersRaw) || [];
+            console.log(`Loaded ${usersCache.length} users from ${DB_FILE}`);
+        } catch (err) {
+            if (err && err.code === 'ENOENT') {
+                usersCache = [];
+                await fsPromises.writeFile(DB_FILE, JSON.stringify(usersCache, null, 2));
+                console.log(`Created missing ${DB_FILE}`);
+            } else {
+                console.error('Failed loading users.json, continuing with empty cache:', err);
+                usersCache = [];
+            }
+        }
+
+        // Messages
+        try {
+            const msgsRaw = await fsPromises.readFile(MSG_FILE, 'utf8');
+            messagesCache = JSON.parse(msgsRaw) || [];
+            console.log(`Loaded ${messagesCache.length} messages from ${MSG_FILE}`);
+        } catch (err) {
+            if (err && err.code === 'ENOENT') {
+                messagesCache = [];
+                await fsPromises.writeFile(MSG_FILE, JSON.stringify(messagesCache, null, 2));
+                console.log(`Created missing ${MSG_FILE}`);
+            } else {
+                console.error('Failed loading messages.json, continuing with empty cache:', err);
+                messagesCache = [];
+            }
+        }
+    } catch (err) {
+        console.error('initCaches error:', err);
+        usersCache = usersCache || [];
+        messagesCache = messagesCache || [];
+    }
+}
+initCaches().catch(err => console.error('initCaches failed:', err));
+
 function loadComments() {
     if (!fs.existsSync(COMMENTS_FILE)) return [];
     try { return JSON.parse(fs.readFileSync(COMMENTS_FILE, 'utf8')); } catch (e) { return []; }
@@ -81,16 +128,34 @@ function sanitizePackName(name) {
 }
 
 function loadUsers() {
-    if (!fs.existsSync(DB_FILE)) return [];
-    try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { return []; }
+    // Return the in-memory cache. initCaches() populates it at startup and keeps the authoritative copy in memory.
+    return usersCache || [];
 }
-function saveUsers(users) { fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2)); }
+function saveUsers(users) {
+    try {
+        usersCache = users || [];
+        // Persist asynchronously; do not block the event loop. Errors are logged.
+        fsPromises.writeFile(DB_FILE, JSON.stringify(usersCache, null, 2))
+            .then(() => console.log(`Saved ${usersCache.length} users to disk`))
+            .catch(err => console.error('❌ ОШИБКА ЗАПИСИ users.json:', err));
+    } catch (err) {
+        console.error('❌ Ошибка в saveUsers (sync):', err);
+    }
+}
 
 function loadMessages() {
-    if (!fs.existsSync(MSG_FILE)) return [];
-    try { return JSON.parse(fs.readFileSync(MSG_FILE, 'utf8')); } catch (e) { return []; }
+    return messagesCache || [];
 }
-function saveMessages(messages) { fs.writeFileSync(MSG_FILE, JSON.stringify(messages, null, 2)); }
+function saveMessages(messages) {
+    try {
+        messagesCache = messages || [];
+        fsPromises.writeFile(MSG_FILE, JSON.stringify(messagesCache, null, 2))
+            .then(() => console.log(`Saved ${messagesCache.length} messages to disk`))
+            .catch(err => console.error('❌ ОШИБКА ЗАПИСИ messages.json:', err));
+    } catch (err) {
+        console.error('❌ Ошибка в saveMessages (sync):', err);
+    }
+}
 
 function loadUserCollection(phone) {
     const users = loadUsers();
@@ -680,7 +745,7 @@ socket.on('update_profile', (data) => {
             return;
         }
 
-        console.log(`💬 [СООБЩЕНИЕ/ЗВОНОК/СТИКЕР] ${socket.phone} -> ${data.recipientPhone} (Тип: ${data.type || 'text'})`);
+        console.log('🔥 СОКЕТ ПРИНЯЛ СООБЩЕНИЕ:', data);
 
         const messages = loadMessages();
         let mediaUrl = null;
@@ -1211,6 +1276,7 @@ app.get('/api/stickers/:packName', (req, res) => {
 
 // Clear chat (remove messages between two phones)
 app.post('/api/chat/clear', (req, res) => {
+    console.log('API /api/chat/clear called:', req.body);
     const { me, other } = req.body;
     if (!me || !other) return res.status(400).json({ error: 'me and other required' });
     let messages = loadMessages();
@@ -1248,6 +1314,7 @@ function emitChatDeleted(me, other, deleteForBoth) {
 }
 
 app.post('/api/chat/delete', (req, res) => {
+    console.log('API /api/chat/delete called:', req.body);
     const { me, other } = req.body;
     if (!me || !other) return res.status(400).json({ error: 'me and other required' });
     applyChatDeletion(me, other, false);
@@ -1256,6 +1323,7 @@ app.post('/api/chat/delete', (req, res) => {
 });
 
 app.post('/api/chat/delete-both', (req, res) => {
+    console.log('API /api/chat/delete-both called:', req.body);
     const { me, other } = req.body;
     if (!me || !other) return res.status(400).json({ error: 'me and other required' });
     applyChatDeletion(me, other, true);
