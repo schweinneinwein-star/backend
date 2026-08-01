@@ -46,14 +46,15 @@ const mongoose = require('mongoose');
 const MONGO_PASSWORD = process.env.MONGO_PASSWORD || 'e70sTKY6FmcDQpBS';
 const MONGO_URI = process.env.MONGO_URI || `mongodb+srv://sparklemms_db_user:${encodeURIComponent(MONGO_PASSWORD)}@cluster0.hr8pwru.mongodb.net/sparkle?retryWrites=true&w=majority`;
 
-mongoose.connect(MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-}).then(() => {
-    console.log('✅ MongoDB connected');
-}).catch(err => {
-    console.error('❌ MongoDB connection error:', err);
-});
+(async () => {
+    try {
+        const uri = process.env.MONGO_URI || MONGO_URI;
+        await mongoose.connect(uri);
+        console.log('✅ MongoDB connected');
+    } catch (err) {
+        console.error('❌ MongoDB connection error:', err);
+    }
+})();
 
 // Define Mongoose schemas and models
 const messageSchema = new mongoose.Schema({
