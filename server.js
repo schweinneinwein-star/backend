@@ -23,8 +23,7 @@ const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
         origin: '*',
-        methods: ['GET', 'POST', 'PUT', 'DELETE'],
-        credentials: true,
+        methods: ['GET', 'POST'],
     },
     transports: ['websocket', 'polling'],
     maxHttpBufferSize: 1e8,
@@ -388,7 +387,7 @@ async function getRealGeoData(ip) {
 }
 
 io.on('connection', (socket) => {
-    console.log('🟢 [СИСТЕМА] Новое подключение:', socket.id);
+    console.log('⚡ Новый пользователь подключился к сокету:', socket.id);
     const clientIp = socket.handshake.address;
 
     // Send recent messages from MongoDB to the newly connected client (last 50)
@@ -889,26 +888,29 @@ socket.on('update_profile', (data) => {
 
     // Robust 'send_message' handler (accepts partial payloads and always emits)
     socket.on('send_message', async (data) => {
+        console.log('📩 Сервер получил сообщение:', data);
         try {
-            console.log('📥 ПРИШЕЛ ЗАПРОС НА СООБЩЕНИЕ:', JSON.stringify(data));
-
-            // Пробуем сохранить в БД
-            const newMessage = await Message.create(data);
-            console.log('✅ СООБЩЕНИЕ УСПЕШНО СОХРАНЕНО В MONGODB:', newMessage);
-
-            // Отправляем всем клиентам
-            io.emit('receive_message', newMessage);
-            console.log('✅ Разослано клиентам!');
-
-        } catch (error) {
-            console.error('❌ ОШИБКА БАЗЫ ДАННЫХ (Mongoose):', error && error.message ? error.message : error);
-            
-            // СПАСАТЕЛЬНЫЙ КРУГ: даже если БД упала, всё равно рассылаем сообщение в чат!
+            const createdMessage = await Message.create({
+                text: data.text || '',
+                sender: data.sender || 'Anonymous',
+                roomId: data.roomId || (data.recipientPhone ? String(data.recipientPhone) : 'general'),
+                recipient: data.recipientPhone || data.recipient || null,
+                type: data.type || 'text',
+                mediaUrl: data.mediaUrl || null,
+                stickerUrl: data.stickerUrl || null,
+                stickerName: data.stickerName || null,
+                packName: data.packName || null,
+                timestamp: data.timestamp ? new Date(data.timestamp) : new Date(),
+                read: typeof data.read === 'boolean' ? data.read : false,
+            });
+            console.log('💾 УСПЕШНО СОХРАНЕНО В MONGO:', createdMessage._id);
+            io.emit('receive_message', createdMessage);
+        } catch (err) {
+            console.error('❌ Ошибка сохранения в Mongo:', err && err.message ? err.message : err);
             try {
-                console.log('⚠️ Отправляю в чат без сохранения в базу...');
                 io.emit('receive_message', data);
             } catch (emitErr) {
-                console.error('❌ Ошибка при попытке рассыла сообщения в качестве fallback:', emitErr);
+                console.error('❌ Ошибка отправки fallback-сообщения:', emitErr && emitErr.message ? emitErr.message : emitErr);
             }
         }
     });
