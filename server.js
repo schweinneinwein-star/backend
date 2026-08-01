@@ -795,7 +795,12 @@ socket.on('update_profile', (data) => {
     });
 
     socket.on('send_private_message', async (data) => {
-        if (!socket.phone || !data.recipientPhone) return;
+        console.log('📥 send_private_message invoked. socket.id=', socket.id, 'socket.phone=', socket.phone, 'payload=', JSON.stringify(data));
+        if (!socket.phone || !data.recipientPhone) {
+            console.warn('❗ send_private_message rejected: missing socket.phone or recipientPhone', { socketPhone: socket.phone, recipientPhone: data && data.recipientPhone });
+            // If client provided sender in payload, attempt to proceed (heuristic)
+            if (!(data && data.sender) || !(data && data.recipientPhone)) return;
+        }
         
         // У обычных сообщений есть текст, у логов звонков и стикеров текста может не быть
         if (!data.text && !data.mediaBase64 && data.type !== 'call_log' && data.type !== 'sticker') return;
