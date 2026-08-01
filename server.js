@@ -1281,15 +1281,17 @@ function saveBase64ToDir(base64Data, targetDir, fileName) {
 function saveBase64Image(base64Data, phone, type) {
     try {
         const matches = base64Data.match(/^data:(.*?);base64,(.+)$/);
-        const mimeType = matches ? matches[1] : 'image/jpeg';
-        const base64String = matches ? matches[2] : base64Data;
+        if (!matches || matches.length !== 3) {
+            console.log("❌ Ошибка парсинга файла: неверный формат base64");
+            return null; 
+        }
+
+        const mimeType = matches[1];
+        const base64String = matches[2];
         let extension = 'bin';
         
         if (mimeType.includes('jpeg') || mimeType.includes('jpg')) extension = 'jpg';
         else if (mimeType.includes('png')) extension = 'png';
-        else if (mimeType.includes('gif')) extension = 'gif';
-        else if (mimeType.includes('webp')) extension = 'webp';
-        else if (mimeType.includes('avif')) extension = 'avif';
         else if (mimeType.includes('mp4')) extension = 'mp4';
         else if (mimeType.includes('quicktime')) extension = 'mp4'; 
         else if (mimeType.includes('webm')) extension = 'webm';
