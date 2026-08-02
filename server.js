@@ -22,6 +22,8 @@ const server = http.createServer(app);
 
 const COMMENTS_FILE = path.join(__dirname, 'comments.json');
 const POSTS_FILE = path.join(__dirname, 'posts.json');
+const DATA_DIR = path.join(__dirname, 'data');
+const GROUPS_FILE = path.join(DATA_DIR, 'groups.json');
 
 const io = new Server(server, {
     cors: {
@@ -41,17 +43,68 @@ const mongoose = require('mongoose');
 const MONGO_PASSWORD = process.env.MONGO_PASSWORD || 'e70sTKY6FmcDQpBS';
 const MONGO_URI = process.env.MONGO_URI || `mongodb+srv://sparklemms_db_user:${encodeURIComponent(MONGO_PASSWORD)}@cluster0.hr8pwru.mongodb.net/sparkle?retryWrites=true&w=majority`;
 
-(async () => {
+let mongoReady = false;
+let mongoConnectionError = null;
+
+function ensureDataDir() {
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+}
+
+function loadGroupsFromFile() {
+    ensureDataDir();
+    if (!fs.existsSync(GROUPS_FILE)) return [];
+    try {
+        return JSON.parse(fs.readFileSync(GROUPS_FILE, 'utf8'));
+    } catch (err) {
+        console.warn('⚠️ Failed to read groups file, starting empty:', err.message || err);
+        return [];
+    }
+}
+
+function saveGroupsToFile(groups) {
+    ensureDataDir();
+    fs.writeFileSync(GROUPS_FILE, JSON.stringify(groups, null, 2));
+    return groups;
+}
+
+function normalizePhoneString(value) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/\D/g, '');
+}
+
+function groupMatchesPhone(group, phone) {
+    if (!group || !phone) return false;
+    const normalizedPhone = normalizePhoneString(phone);
+    if (!normalizedPhone) return false;
+    if (normalizePhoneString(group.createdBy) === normalizedPhone) return true;
+    return Array.isArray(group.members) && group.members.some((member) => {
+        const memberPhone = normalizePhoneString(member?.phone || member?.userId);
+        return memberPhone === normalizedPhone;
+    });
+}
+
+async function connectMongoWithFallback() {
     try {
         const uri = process.env.MONGO_URI || MONGO_URI;
-        await mongoose.connect(uri);
+        await mongoose.connect(uri, {
+            serverSelectionTimeoutMS: 10000,
+            connectTimeoutMS: 10000,
+        });
+        mongoReady = true;
+        mongoConnectionError = null;
         console.log('✅ MongoDB connected');
-
         await initCaches();
     } catch (err) {
-        console.error('❌ MongoDB connection error:', err);
+        mongoReady = false;
+        mongoConnectionError = err;
+        console.warn('⚠️ MongoDB unavailable; groups will be stored in local JSON until MongoDB is reachable:', err.message || err);
+        await initCaches();
     }
-})();
+}
+
+connectMongoWithFallback();
 
 // Define Mongoose schemas and models
 const messageSchema = new mongoose.Schema({
@@ -138,7 +191,7 @@ async function saveUsers(users) {
             return User.findOneAndUpdate(
                 { phone: user.phone },
                 { $set: user },
-                { upsert: true, new: true, setDefaultsOnInsert: true }
+                { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
             ).exec();
         }));
         console.log(`Saved ${usersCache.length} users to MongoDB`);
@@ -170,15 +223,24 @@ function savePosts(posts) { fs.writeFileSync(POSTS_FILE, JSON.stringify(posts, n
 
 function normalizeGroupPayload(payload) {
     if (!payload || typeof payload !== 'object') return null;
-    const members = Array.isArray(payload.members) ? payload.members : [];
+    const members = Array.isArray(payload.members) ? payload.members.map((member) => {
+        if (!member || typeof member !== 'object') return member;
+        const normalizedPhone = normalizePhoneString(member.phone || member.userId);
+        return {
+            ...member,
+            phone: normalizedPhone,
+            userId: normalizePhoneString(member.userId) || normalizedPhone,
+        };
+    }) : [];
     const createdAt = payload.createdAt || payload.created_at || Date.now();
+    const createdBy = normalizePhoneString(payload.createdBy || payload.created_by || payload.creatorPhone || payload.createdByPhone);
     return {
         id: payload.id || payload._id || `group_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         type: payload.type || 'group',
         title: payload.title || payload.name || 'Group',
         description: payload.description || null,
         avatarUrl: payload.avatarUrl || null,
-        createdBy: payload.createdBy || payload.created_by || null,
+        createdBy,
         createdAt,
         updatedAt: payload.updatedAt || payload.updated_at || createdAt,
         members,
@@ -215,14 +277,24 @@ app.get('/groups', async (req, res) => {
         if (!phone) {
             return res.status(400).json({ error: 'phone is required' });
         }
-        const groups = await Group.find({
-            $or: [
-                { createdBy: phone },
-                { members: { $elemMatch: { phone } } },
-                { members: { $elemMatch: { userId: phone } } },
-            ],
-        }).sort({ createdAt: -1 }).lean();
-        res.json(groups);
+
+        if (mongoReady && mongoose.connection.readyState === 1) {
+            try {
+                const groups = await Group.find({
+                    $or: [
+                        { createdBy: normalizePhoneString(phone) },
+                        { members: { $elemMatch: { phone: normalizePhoneString(phone) } } },
+                        { members: { $elemMatch: { userId: normalizePhoneString(phone) } } },
+                    ],
+                }).sort({ createdAt: -1 }).lean();
+                return res.json(groups);
+            } catch (err) {
+                console.warn('Mongo group query failed, falling back to file store:', err.message || err);
+            }
+        }
+
+        const groups = loadGroupsFromFile().filter((group) => groupMatchesPhone(group, phone));
+        return res.json(groups);
     } catch (err) {
         console.error('Failed to list groups:', err);
         res.status(500).json({ error: 'Failed to list groups' });
@@ -238,8 +310,20 @@ app.post('/groups', async (req, res) => {
         if (!payload.createdBy) {
             return res.status(400).json({ error: 'createdBy is required' });
         }
-        const created = await Group.create(payload);
-        res.status(201).json(created);
+
+        if (mongoReady && mongoose.connection.readyState === 1) {
+            try {
+                const created = await Group.create(payload);
+                return res.status(201).json(created.toObject ? created.toObject() : created);
+            } catch (err) {
+                console.warn('Mongo group create failed, falling back to file store:', err.message || err);
+            }
+        }
+
+        const existingGroups = loadGroupsFromFile();
+        const nextGroups = [payload, ...existingGroups.filter((group) => group.id !== payload.id)];
+        saveGroupsToFile(nextGroups);
+        return res.status(201).json(payload);
     } catch (err) {
         console.error('Failed to create group:', err);
         res.status(500).json({ error: 'Failed to create group' });
@@ -972,12 +1056,22 @@ socket.on('update_profile', (data) => {
         });
         if (!payload?.title || !Array.isArray(payload.members)) return socket.emit('group_creation_error', 'Invalid group payload');
         try {
-            const group = await Group.create(payload);
-            console.log('✅ Group saved to MongoDB:', JSON.stringify(group.toObject ? group.toObject() : group));
+            let group = null;
+            if (mongoReady && mongoose.connection.readyState === 1) {
+                group = await Group.create(payload);
+                group = group.toObject ? group.toObject() : group;
+                console.log('✅ Group saved to MongoDB:', JSON.stringify(group));
+            } else {
+                const existingGroups = loadGroupsFromFile();
+                group = payload;
+                const nextGroups = [group, ...existingGroups.filter((existing) => existing.id !== group.id)];
+                saveGroupsToFile(nextGroups);
+                console.log('✅ Group saved to local file store:', JSON.stringify(group));
+            }
             io.emit('group_created', group);
             socket.emit('group_created', group);
         } catch (err) {
-            console.error('❌ Failed to create group in MongoDB:', err);
+            console.error('❌ Failed to create group:', err);
             socket.emit('group_creation_error', err.message || 'Failed to create group');
         }
     });
