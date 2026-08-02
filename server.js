@@ -22,8 +22,7 @@ const server = http.createServer(app);
 
 const COMMENTS_FILE = path.join(__dirname, 'comments.json');
 const POSTS_FILE = path.join(__dirname, 'posts.json');
-const DATA_DIR = path.join(__dirname, 'data');
-const GROUPS_FILE = path.join(DATA_DIR, 'groups.json');
+// IMPORTANT: Groups must be persisted in MongoDB only. No local JSON fallback.
 
 const io = new Server(server, {
     cors: {
@@ -46,29 +45,6 @@ const MONGO_URI = process.env.MONGO_URI || `mongodb+srv://sparklemms_db_user:${e
 let mongoReady = false;
 let mongoConnectionError = null;
 
-function ensureDataDir() {
-    if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-}
-
-function loadGroupsFromFile() {
-    ensureDataDir();
-    if (!fs.existsSync(GROUPS_FILE)) return [];
-    try {
-        return JSON.parse(fs.readFileSync(GROUPS_FILE, 'utf8'));
-    } catch (err) {
-        console.warn('⚠️ Failed to read groups file, starting empty:', err.message || err);
-        return [];
-    }
-}
-
-function saveGroupsToFile(groups) {
-    ensureDataDir();
-    fs.writeFileSync(GROUPS_FILE, JSON.stringify(groups, null, 2));
-    return groups;
-}
-
 function normalizePhoneString(value) {
     if (value === null || value === undefined) return '';
     return String(value).replace(/\D/g, '');
@@ -85,9 +61,58 @@ function groupMatchesPhone(group, phone) {
     });
 }
 
-async function connectMongoWithFallback() {
+function maskMongoUri(uri) {
     try {
-        const uri = process.env.MONGO_URI || MONGO_URI;
+        if (!uri) return '';
+        // hide password portion for logging
+        return uri.replace(/(mongodb(?:\+srv)?:\/\/)([^:@\/\s]+)(:)([^@\/\s]+)(@)/i, (m, p1, user, colon, pass, at) => `${p1}${user}:***${at}`);
+    } catch (e) {
+        return '[masked]';
+    }
+}
+
+const dns = require('dns').promises;
+
+async function resolveMongoSrv(uri) {
+    try {
+        if (!uri) return null;
+        const match = uri.match(/^mongodb\+srv:\/\/([^\/\?]+)/i);
+        if (!match) return null;
+        let host = match[1];
+        // strip credentials if present: user:pass@host => host
+        if (host.includes('@')) {
+            host = host.split('@').pop();
+        }
+        try {
+            const srv = await dns.resolveSrv(`_mongodb._tcp.${host}`);
+            return { host, srv };
+        } catch (e) {
+            // try plain lookup
+            try {
+                const lookup = await dns.lookup(host, { all: true });
+                return { host, lookup };
+            } catch (le) {
+                return { host, error: le.message || String(le) };
+            }
+        }
+    } catch (err) {
+        return { error: err.message || String(err) };
+    }
+}
+
+// Try to connect to MongoDB and retry on failure with exponential backoff. Detailed logging for diagnostics.
+async function connectMongoWithRetry(attempt = 0) {
+    const maxAttempts = 10;
+    const delayMs = Math.min(30000, 1000 * Math.pow(2, attempt)); // cap at 30s
+    const uri = process.env.MONGO_URI || MONGO_URI;
+    const masked = maskMongoUri(uri);
+    console.log(`MongoDB connection attempt ${attempt + 1}: uri=${masked}`);
+
+    try {
+        // Log DNS/SRV resolution if SRV used
+        const srvInfo = await resolveMongoSrv(uri).catch(() => null);
+        if (srvInfo) console.log('Mongo SRV/lookup info:', srvInfo);
+
         await mongoose.connect(uri, {
             serverSelectionTimeoutMS: 10000,
             connectTimeoutMS: 10000,
@@ -99,12 +124,31 @@ async function connectMongoWithFallback() {
     } catch (err) {
         mongoReady = false;
         mongoConnectionError = err;
-        console.warn('⚠️ MongoDB unavailable; groups will be stored in local JSON until MongoDB is reachable:', err.message || err);
-        await initCaches();
+        console.error(`⚠️ MongoDB connection attempt ${attempt + 1} failed:`, { name: err.name, code: err.code, message: err.message });
+        if (attempt < maxAttempts - 1) {
+            console.log(`Retrying MongoDB connection in ${delayMs}ms... (attempt ${attempt + 2}/${maxAttempts})`);
+            setTimeout(() => connectMongoWithRetry(attempt + 1), delayMs);
+        } else {
+            console.error('❌ MongoDB connection failed after multiple attempts. Group endpoints will return 503 until DB is available.');
+        }
     }
 }
 
-connectMongoWithFallback();
+connectMongoWithRetry();
+
+// Debug endpoint to inspect Mongo connection status and resolution
+app.get('/debug/mongo', async (req, res) => {
+    try {
+        const uri = process.env.MONGO_URI || MONGO_URI;
+        const masked = maskMongoUri(uri);
+        const srv = await resolveMongoSrv(uri).catch((e) => ({ error: e.message || String(e) }));
+        const connected = mongoReady && mongoose.connection.readyState === 1;
+        const err = mongoConnectionError ? { name: mongoConnectionError.name, code: mongoConnectionError.code, message: mongoConnectionError.message } : null;
+        return res.json({ connected, uri: masked, srv, connectionState: mongoose.connection.readyState, error: err });
+    } catch (e) {
+        return res.status(500).json({ error: e.message || String(e) });
+    }
+});
 
 // Define Mongoose schemas and models
 const messageSchema = new mongoose.Schema({
@@ -278,22 +322,17 @@ app.get('/groups', async (req, res) => {
             return res.status(400).json({ error: 'phone is required' });
         }
 
-        if (mongoReady && mongoose.connection.readyState === 1) {
-            try {
-                const groups = await Group.find({
-                    $or: [
-                        { createdBy: normalizePhoneString(phone) },
-                        { members: { $elemMatch: { phone: normalizePhoneString(phone) } } },
-                        { members: { $elemMatch: { userId: normalizePhoneString(phone) } } },
-                    ],
-                }).sort({ createdAt: -1 }).lean();
-                return res.json(groups);
-            } catch (err) {
-                console.warn('Mongo group query failed, falling back to file store:', err.message || err);
-            }
+        if (!mongoReady || mongoose.connection.readyState !== 1) {
+            return res.status(503).json({ error: 'Service unavailable: MongoDB not connected' });
         }
 
-        const groups = loadGroupsFromFile().filter((group) => groupMatchesPhone(group, phone));
+        const groups = await Group.find({
+            $or: [
+                { createdBy: normalizePhoneString(phone) },
+                { members: { $elemMatch: { phone: normalizePhoneString(phone) } } },
+                { members: { $elemMatch: { userId: normalizePhoneString(phone) } } },
+            ],
+        }).sort({ createdAt: -1 }).lean();
         return res.json(groups);
     } catch (err) {
         console.error('Failed to list groups:', err);
@@ -311,19 +350,12 @@ app.post('/groups', async (req, res) => {
             return res.status(400).json({ error: 'createdBy is required' });
         }
 
-        if (mongoReady && mongoose.connection.readyState === 1) {
-            try {
-                const created = await Group.create(payload);
-                return res.status(201).json(created.toObject ? created.toObject() : created);
-            } catch (err) {
-                console.warn('Mongo group create failed, falling back to file store:', err.message || err);
-            }
+        if (!mongoReady || mongoose.connection.readyState !== 1) {
+            return res.status(503).json({ error: 'Service unavailable: MongoDB not connected' });
         }
 
-        const existingGroups = loadGroupsFromFile();
-        const nextGroups = [payload, ...existingGroups.filter((group) => group.id !== payload.id)];
-        saveGroupsToFile(nextGroups);
-        return res.status(201).json(payload);
+        const created = await Group.create(payload);
+        return res.status(201).json(created.toObject ? created.toObject() : created);
     } catch (err) {
         console.error('Failed to create group:', err);
         res.status(500).json({ error: 'Failed to create group' });
@@ -1056,20 +1088,19 @@ socket.on('update_profile', (data) => {
         });
         if (!payload?.title || !Array.isArray(payload.members)) return socket.emit('group_creation_error', 'Invalid group payload');
         try {
-            let group = null;
-            if (mongoReady && mongoose.connection.readyState === 1) {
-                group = await Group.create(payload);
-                group = group.toObject ? group.toObject() : group;
-                console.log('✅ Group saved to MongoDB:', JSON.stringify(group));
-            } else {
-                const existingGroups = loadGroupsFromFile();
-                group = payload;
-                const nextGroups = [group, ...existingGroups.filter((existing) => existing.id !== group.id)];
-                saveGroupsToFile(nextGroups);
-                console.log('✅ Group saved to local file store:', JSON.stringify(group));
+            if (!mongoReady || mongoose.connection.readyState !== 1) {
+                return socket.emit('group_creation_error', 'Service unavailable: MongoDB not connected');
             }
-            io.emit('group_created', group);
-            socket.emit('group_created', group);
+            try {
+                const group = await Group.create(payload);
+                const groupObj = group.toObject ? group.toObject() : group;
+                console.log('✅ Group saved to MongoDB:', JSON.stringify(groupObj));
+                io.emit('group_created', groupObj);
+                socket.emit('group_created', groupObj);
+            } catch (err) {
+                console.error('❌ Failed to create group in MongoDB (socket path):', err);
+                socket.emit('group_creation_error', err.message || 'Failed to create group');
+            }
         } catch (err) {
             console.error('❌ Failed to create group:', err);
             socket.emit('group_creation_error', err.message || 'Failed to create group');
