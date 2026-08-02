@@ -342,22 +342,29 @@ app.get('/groups', async (req, res) => {
 
 app.post('/groups', async (req, res) => {
     try {
+        console.log('📥 [SERVER] Получил HTTP запрос на создание группы:', JSON.stringify(req.body));
         const payload = normalizeGroupPayload(req.body);
         if (!payload) {
+            console.warn('⚠️ [SERVER] HTTP /groups валидатор отклонил payload:', req.body);
             return res.status(400).json({ error: 'Invalid group payload' });
         }
         if (!payload.createdBy) {
+            console.warn('⚠️ [SERVER] HTTP /groups missing createdBy:', payload);
             return res.status(400).json({ error: 'createdBy is required' });
         }
 
         if (!mongoReady || mongoose.connection.readyState !== 1) {
+            console.warn('⚠️ [SERVER] HTTP /groups MongoDB не подключен');
             return res.status(503).json({ error: 'Service unavailable: MongoDB not connected' });
         }
 
+        console.log('📦 [SERVER] HTTP /groups отправляю сигнал на MongoDB:', JSON.stringify(payload));
         const created = await Group.create(payload);
-        return res.status(201).json(created.toObject ? created.toObject() : created);
+        const createdObj = created.toObject ? created.toObject() : created;
+        console.log('✅ [SERVER] HTTP /groups сигнал от MongoDB получен - группа сохранена:', createdObj.id || createdObj._id || createdObj.title);
+        return res.status(201).json(createdObj);
     } catch (err) {
-        console.error('Failed to create group:', err);
+        console.error('❌ [SERVER] HTTP /groups сигнал от MongoDB получен - запись не выполнена:', err);
         res.status(500).json({ error: 'Failed to create group' });
     }
 });
@@ -1080,29 +1087,35 @@ socket.on('update_profile', (data) => {
 
     // Group creation via socket
     socket.on('create_group', async (data) => {
-        if (!socket.phone) return socket.emit('group_creation_error', 'Not authenticated');
+        console.log('📥 [SERVER] Получил socket create_group от', socket.phone || 'unknown', 'payload:', JSON.stringify(data));
+        if (!socket.phone) {
+            console.warn('⚠️ [SERVER] socket create_group отклонён: неавторизован');
+            return socket.emit('group_creation_error', 'Not authenticated');
+        }
+
         const payload = normalizeGroupPayload({
             ...data,
             createdBy: data?.createdBy || socket.phone,
             title: data?.title || data?.name,
         });
-        if (!payload?.title || !Array.isArray(payload.members)) return socket.emit('group_creation_error', 'Invalid group payload');
+        if (!payload?.title || !Array.isArray(payload.members)) {
+            console.warn('⚠️ [SERVER] socket create_group валидатор отклонил payload:', payload);
+            return socket.emit('group_creation_error', 'Invalid group payload');
+        }
+
         try {
             if (!mongoReady || mongoose.connection.readyState !== 1) {
+                console.warn('⚠️ [SERVER] socket create_group MongoDB не подключен');
                 return socket.emit('group_creation_error', 'Service unavailable: MongoDB not connected');
             }
-            try {
-                const group = await Group.create(payload);
-                const groupObj = group.toObject ? group.toObject() : group;
-                console.log('✅ Group saved to MongoDB:', JSON.stringify(groupObj));
-                io.emit('group_created', groupObj);
-                socket.emit('group_created', groupObj);
-            } catch (err) {
-                console.error('❌ Failed to create group in MongoDB (socket path):', err);
-                socket.emit('group_creation_error', err.message || 'Failed to create group');
-            }
+            console.log('📦 [SERVER] socket create_group отправляю сигнал на MongoDB:', JSON.stringify(payload));
+            const group = await Group.create(payload);
+            const groupObj = group.toObject ? group.toObject() : group;
+            console.log('✅ [SERVER] socket create_group сигнал от MongoDB получен - группа сохранена:', groupObj.id || groupObj._id || groupObj.title);
+            io.emit('group_created', groupObj);
+            socket.emit('group_created', groupObj);
         } catch (err) {
-            console.error('❌ Failed to create group:', err);
+            console.error('❌ [SERVER] socket create_group сигнал от MongoDB получен - запись не выполнена:', err);
             socket.emit('group_creation_error', err.message || 'Failed to create group');
         }
     });
