@@ -973,6 +973,7 @@ socket.on('update_profile', (data) => {
         if (!payload?.title || !Array.isArray(payload.members)) return socket.emit('group_creation_error', 'Invalid group payload');
         try {
             const group = await Group.create(payload);
+            console.log('✅ Group saved to MongoDB:', JSON.stringify(group.toObject ? group.toObject() : group));
             io.emit('group_created', group);
             socket.emit('group_created', group);
         } catch (err) {
