@@ -70,10 +70,22 @@ const messageSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const groupSchema = new mongoose.Schema({
-    name: { type: String, required: true },
-    members: { type: [String], default: [] },
-    createdAt: { type: Date, default: Date.now }
-});
+    id: { type: String, required: true, unique: true },
+    type: { type: String, default: 'group' },
+    title: { type: String, required: true },
+    description: { type: String, default: null },
+    avatarUrl: { type: String, default: null },
+    createdBy: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now },
+    members: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    inviteCode: { type: String, default: null },
+    settings: { type: mongoose.Schema.Types.Mixed, default: {} },
+    pinnedMessageId: { type: String, default: null },
+    lastMessage: { type: mongoose.Schema.Types.Mixed, default: null },
+    messages: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    unreadCount: { type: Number, default: 0 },
+}, { timestamps: true });
 
 const userSchema = new mongoose.Schema({
     phone: { type: String, required: true, unique: true },
@@ -156,6 +168,29 @@ function loadPosts() {
 }
 function savePosts(posts) { fs.writeFileSync(POSTS_FILE, JSON.stringify(posts, null, 2)); }
 
+function normalizeGroupPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const members = Array.isArray(payload.members) ? payload.members : [];
+    const createdAt = payload.createdAt || payload.created_at || Date.now();
+    return {
+        id: payload.id || payload._id || `group_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type: payload.type || 'group',
+        title: payload.title || payload.name || 'Group',
+        description: payload.description || null,
+        avatarUrl: payload.avatarUrl || null,
+        createdBy: payload.createdBy || payload.created_by || null,
+        createdAt,
+        updatedAt: payload.updatedAt || payload.updated_at || createdAt,
+        members,
+        inviteCode: payload.inviteCode || payload.invite_code || null,
+        settings: payload.settings || {},
+        pinnedMessageId: payload.pinnedMessageId || null,
+        lastMessage: payload.lastMessage || null,
+        messages: Array.isArray(payload.messages) ? payload.messages : [],
+        unreadCount: Number.isFinite(payload.unreadCount) ? payload.unreadCount : 0,
+    };
+}
+
 app.use(
     cors({
         origin: '*',
@@ -173,6 +208,43 @@ app.get('/', (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/stickerpacks', express.static(path.join(__dirname, 'stickerpacks')));
+
+app.get('/groups', async (req, res) => {
+    try {
+        const phone = req.query.phone;
+        if (!phone) {
+            return res.status(400).json({ error: 'phone is required' });
+        }
+        const groups = await Group.find({
+            $or: [
+                { createdBy: phone },
+                { members: { $elemMatch: { phone } } },
+                { members: { $elemMatch: { userId: phone } } },
+            ],
+        }).sort({ createdAt: -1 }).lean();
+        res.json(groups);
+    } catch (err) {
+        console.error('Failed to list groups:', err);
+        res.status(500).json({ error: 'Failed to list groups' });
+    }
+});
+
+app.post('/groups', async (req, res) => {
+    try {
+        const payload = normalizeGroupPayload(req.body);
+        if (!payload) {
+            return res.status(400).json({ error: 'Invalid group payload' });
+        }
+        if (!payload.createdBy) {
+            return res.status(400).json({ error: 'createdBy is required' });
+        }
+        const created = await Group.create(payload);
+        res.status(201).json(created);
+    } catch (err) {
+        console.error('Failed to create group:', err);
+        res.status(500).json({ error: 'Failed to create group' });
+    }
+});
 
 function sanitizePackName(name) {
     const raw = (name || '').toString().trim();
@@ -893,11 +965,14 @@ socket.on('update_profile', (data) => {
     // Group creation via socket
     socket.on('create_group', async (data) => {
         if (!socket.phone) return socket.emit('group_creation_error', 'Not authenticated');
-        const { name, members } = data || {};
-        if (!name || !Array.isArray(members)) return socket.emit('group_creation_error', 'Invalid group payload');
+        const payload = normalizeGroupPayload({
+            ...data,
+            createdBy: data?.createdBy || socket.phone,
+            title: data?.title || data?.name,
+        });
+        if (!payload?.title || !Array.isArray(payload.members)) return socket.emit('group_creation_error', 'Invalid group payload');
         try {
-            const group = await Group.create({ name: name.toString().trim(), members, createdAt: new Date() });
-            // Optionally: update user records to reference group (not implemented)
+            const group = await Group.create(payload);
             io.emit('group_created', group);
             socket.emit('group_created', group);
         } catch (err) {
