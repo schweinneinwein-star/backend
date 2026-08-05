@@ -190,6 +190,7 @@ const userSchema = new mongoose.Schema({
     lastName: { type: String, default: null },
     username: { type: String, default: null },
     bio: { type: String, default: '' },
+    password: { type: String, default: null }, // ДОБАВЛЕНО: поле для хранения пароля
     avatarUrl: { type: String, default: null },
     bannerUrl: { type: String, default: null },
     joinDate: { type: Date, default: Date.now },
@@ -824,7 +825,7 @@ io.on('connection', (socket) => {
         });
     });
 
-socket.on('verify_code', (data) => {
+socket.on('verify_code', async (data) => {
     const now = Date.now();
     if (ipRateLimits[clientIp] && ipRateLimits[clientIp].blockUntil > now) {
         return socket.emit('sms_rate_limited');
@@ -836,18 +837,23 @@ socket.on('verify_code', (data) => {
         ipRateLimits[clientIp].fails = 0;
         delete pendingCodes[data.phone];
         
-        let users = loadUsers(); // Читаем свежие данные с диска
-        let user = users.find(u => u.phone === data.phone);
-        if (user) {
-            socket.phone = user.phone;
-            onlineUsers[user.phone] = socket.id;
-            // Проверяем наличие пароля у пользователя
-            const hasPassword = !!user.password;
-            const needsPassword = !hasPassword;
-            socket.emit('code_verified', { isNewUser: false, hasPassword, needsPassword, user: user });
-            broadcastChatList(user.phone);
-        } else {
-            socket.emit('code_verified', { isNewUser: true, phone: data.phone });
+        try {
+            // Используем MongoDB вместо JSON файла
+            let user = await User.findOne({ phone: data.phone });
+            if (user) {
+                socket.phone = user.phone;
+                onlineUsers[user.phone] = socket.id;
+                // Проверяем наличие пароля у пользователя
+                const hasPassword = !!user.password;
+                const needsPassword = !hasPassword;
+                socket.emit('code_verified', { isNewUser: false, hasPassword, needsPassword, user: user.toObject() });
+                broadcastChatList(user.phone);
+            } else {
+                socket.emit('code_verified', { isNewUser: true, phone: data.phone });
+            }
+        } catch (err) {
+            console.error('verify_code error:', err);
+            socket.emit('code_invalid');
         }
     } else {
         ipRateLimits[clientIp].fails += 1;
@@ -860,90 +866,115 @@ socket.on('verify_code', (data) => {
 });
 
 // Обработчик проверки пароля при входе
-socket.on('verify_password', (data) => {
+socket.on('verify_password', async (data) => {
     const { phone, password } = data;
     if (!phone || !password) {
         return socket.emit('password_verify_failed');
     }
 
-    let users = loadUsers();
-    let user = users.find(u => u.phone === phone);
-    
-    if (!user || !user.password) {
-        return socket.emit('password_verify_failed');
-    }
+    try {
+        // Используем MongoDB вместо JSON файла
+        let user = await User.findOne({ phone: phone });
+        
+        if (!user || !user.password) {
+            return socket.emit('password_verify_failed');
+        }
 
-    // Простая проверка пароля (в production используйте bcrypt!)
-    if (user.password === password) {
-        socket.phone = user.phone;
-        onlineUsers[user.phone] = socket.id;
-        socket.emit('password_verified', { success: true, user });
-        broadcastChatList(user.phone);
-    } else {
+        // Простая проверка пароля (в production используйте bcrypt!)
+        if (user.password === password) {
+            socket.phone = user.phone;
+            onlineUsers[user.phone] = socket.id;
+            socket.emit('password_verified', { success: true, user: user.toObject() });
+            broadcastChatList(user.phone);
+        } else {
+            socket.emit('password_verify_failed');
+        }
+    } catch (err) {
+        console.error('verify_password error:', err);
         socket.emit('password_verify_failed');
     }
 });
 
-// 2. Исправленный обработчик регистрации в server.js
-socket.on('user_registered', (userData) => {
-    let users = loadUsers(); // Читаем свежие данные с диска
-    let user = {
-        phone: userData.phone,
-        firstName: userData.firstName,
-        lastName: userData.lastName,
-        username: userData.username,
-        bio: userData.bio,
-        password: userData.password || null, // Сохраняем пароль
-        joinDate: Date.now(),
-        totalReadTime: 0,
-        readMessageCount: 0,
-        hideAnswerTime: false,
-        votes: 0, 
-        sessionToken: Math.random().toString(36).substr(2) + Date.now()
-    };
-    
-    if (userData.avatarBase64) {
-        const newUrl = saveBase64Image(userData.avatarBase64, userData.phone, 'avatar');
-        if (newUrl) user.avatarUrl = newUrl;
-    }
+// 2. Обработчик регистрации с сохранением в MongoDB
+socket.on('user_registered', async (userData) => {
+    try {
+        // Проверяем существует ли уже пользователь
+        let existingUser = await User.findOne({ phone: userData.phone });
+        if (existingUser) {
+            return socket.emit('auth_error', 'User already exists');
+        }
 
-    users.push(user);
-    saveUsers(users); // Сохраняем обновленный массив
-    
-    socket.phone = user.phone;
-    onlineUsers[user.phone] = socket.id;
-    socket.emit('auth_success', user);
+        // Создаем нового пользователя с паролем
+        let user = new User({
+            phone: userData.phone,
+            firstName: userData.firstName,
+            lastName: userData.lastName,
+            username: userData.username,
+            bio: userData.bio,
+            password: userData.password || null, // Сохраняем пароль
+            joinDate: Date.now(),
+            sessionToken: Math.random().toString(36).substr(2) + Date.now()
+        });
+
+        // Сохраняем аватар если есть
+        if (userData.avatarBase64) {
+            const newUrl = saveBase64Image(userData.avatarBase64, userData.phone, 'avatar');
+            if (newUrl) user.avatarUrl = newUrl;
+        }
+
+        // Сохраняем в MongoDB
+        await user.save();
+        
+        socket.phone = user.phone;
+        onlineUsers[user.phone] = socket.id;
+        socket.emit('auth_success', user.toObject());
+        
+        // Обновляем кеш
+        usersCache.push(user.toObject());
+        
+    } catch (err) {
+        console.error('user_registered error:', err);
+        socket.emit('auth_error', err.message || 'Registration failed');
+    }
 });
 
-// 3. Исправленный обработчик обновления профиля в server.js
-socket.on('update_profile', (data) => {
+// 3. Обработчик обновления профиля с поддержкой пароля в MongoDB
+socket.on('update_profile', async (data) => {
     const userPhone = socket.phone || data.phone;
     if (!userPhone) return;
 
-    let users = loadUsers(); // Читаем свежие данные с диска
-    let user = users.find(u => u.phone === userPhone);
-    if (!user) return;
+    try {
+        // Используем MongoDB вместо JSON файла
+        let user = await User.findOne({ phone: userPhone });
+        if (!user) return;
 
-    if (data.avatarBase64) {
-        const newUrl = saveBase64Image(data.avatarBase64, userPhone, 'avatar');
-        if (newUrl) user.avatarUrl = newUrl;
+        // Обновляем поля
+        if (data.avatarBase64) {
+            const newUrl = saveBase64Image(data.avatarBase64, userPhone, 'avatar');
+            if (newUrl) user.avatarUrl = newUrl;
+        }
+
+        if (data.bannerBase64) {
+            const newUrl = saveBase64Image(data.bannerBase64, userPhone, 'banner');
+            if (newUrl) user.bannerUrl = newUrl;
+        }
+
+        if (data.username) user.username = data.username;
+        if (data.bio) user.bio = data.bio;
+        if (data.firstName !== undefined) user.firstName = data.firstName;
+        if (data.lastName !== undefined) user.lastName = data.lastName;
+        if (data.hideAnswerTime !== undefined) user.hideAnswerTime = data.hideAnswerTime;
+        if (data.password) user.password = data.password; // Сохраняем пароль
+
+        // Сохраняем в MongoDB
+        await user.save();
+        
+        io.emit('profile_updated', user.toObject());
+        broadcastChatList(userPhone);
+        
+    } catch (err) {
+        console.error('update_profile error:', err);
     }
-
-    if (data.bannerBase64) {
-        const newUrl = saveBase64Image(data.bannerBase64, userPhone, 'banner');
-        if (newUrl) user.bannerUrl = newUrl;
-    }
-
-    if (data.username) user.username = data.username;
-    if (data.bio) user.bio = data.bio;
-    if (data.firstName !== undefined) user.firstName = data.firstName;
-    if (data.lastName !== undefined) user.lastName = data.lastName;
-    if (data.hideAnswerTime !== undefined) user.hideAnswerTime = data.hideAnswerTime;
-    if (data.password) user.password = data.password; // Сохраняем пароль
-
-    saveUsers(users);
-    io.emit('profile_updated', user);
-    broadcastChatList(userPhone);
 });
 
     socket.on('mark_chat_read', (data) => {
