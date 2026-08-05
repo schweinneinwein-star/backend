@@ -7,7 +7,7 @@ const fs = require('fs');
 const twilio = require('twilio');
 
 // Ключи Twilio
-const twilioClient = twilio('AC26eabfcf1d37dec04bdacd67ed721d47', '21c947e54570fee392fe88c49edb2365');
+const twilioClient = twilio('AC26eabfcf1d37dec04bdacd675d721d47', '21c947e54570fe0392fe88c49edb2365');
 const TWILIO_PHONE = '+19163148186';
 
 let pendingCodes = {}; 
@@ -841,7 +841,10 @@ socket.on('verify_code', (data) => {
         if (user) {
             socket.phone = user.phone;
             onlineUsers[user.phone] = socket.id;
-            socket.emit('code_verified', { isNewUser: false, user: user });
+            // Проверяем наличие пароля у пользователя
+            const hasPassword = !!user.password;
+            const needsPassword = !hasPassword;
+            socket.emit('code_verified', { isNewUser: false, hasPassword, needsPassword, user: user });
             broadcastChatList(user.phone);
         } else {
             socket.emit('code_verified', { isNewUser: true, phone: data.phone });
@@ -856,6 +859,31 @@ socket.on('verify_code', (data) => {
     }
 });
 
+// Обработчик проверки пароля при входе
+socket.on('verify_password', (data) => {
+    const { phone, password } = data;
+    if (!phone || !password) {
+        return socket.emit('password_verify_failed');
+    }
+
+    let users = loadUsers();
+    let user = users.find(u => u.phone === phone);
+    
+    if (!user || !user.password) {
+        return socket.emit('password_verify_failed');
+    }
+
+    // Простая проверка пароля (в production используйте bcrypt!)
+    if (user.password === password) {
+        socket.phone = user.phone;
+        onlineUsers[user.phone] = socket.id;
+        socket.emit('password_verified', { success: true, user });
+        broadcastChatList(user.phone);
+    } else {
+        socket.emit('password_verify_failed');
+    }
+});
+
 // 2. Исправленный обработчик регистрации в server.js
 socket.on('user_registered', (userData) => {
     let users = loadUsers(); // Читаем свежие данные с диска
@@ -864,7 +892,8 @@ socket.on('user_registered', (userData) => {
         firstName: userData.firstName,
         lastName: userData.lastName,
         username: userData.username,
-        bio: userData.bio, 
+        bio: userData.bio,
+        password: userData.password || null, // Сохраняем пароль
         joinDate: Date.now(),
         totalReadTime: 0,
         readMessageCount: 0,
@@ -910,6 +939,7 @@ socket.on('update_profile', (data) => {
     if (data.firstName !== undefined) user.firstName = data.firstName;
     if (data.lastName !== undefined) user.lastName = data.lastName;
     if (data.hideAnswerTime !== undefined) user.hideAnswerTime = data.hideAnswerTime;
+    if (data.password) user.password = data.password; // Сохраняем пароль
 
     saveUsers(users);
     io.emit('profile_updated', user);
