@@ -7,7 +7,7 @@ const fs = require('fs');
 const twilio = require('twilio');
 
 // Ключи Twilio
-const twilioClient = twilio('AC26eabfcf1d37dec04bdacd675d721d47', '21c947e54570fe0392fe88c49edb2365');
+const twilioClient = twilio('AC26eabfcf1d37dec04bdacd67ed721d47', '21c947e54570fee392fe88c49edb2365');
 const TWILIO_PHONE = '+19163148186';
 
 let pendingCodes = {}; 
