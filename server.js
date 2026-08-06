@@ -21,16 +21,23 @@ if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-    console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.');
+const missingCloudinaryVars = !process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET;
+
+if (process.env.CLOUDINARY_URL) {
+    cloudinary.config(process.env.CLOUDINARY_URL);
+    cloudinary.config({ secure: true });
+} else {
+    cloudinary.config({
+        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+        api_key: process.env.CLOUDINARY_API_KEY,
+        api_secret: process.env.CLOUDINARY_API_SECRET,
+        secure: true,
+    });
 }
 
-cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
-    secure: true,
-});
+if (missingCloudinaryVars && !process.env.CLOUDINARY_URL) {
+    console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET or CLOUDINARY_URL.');
+}
 
 const cloudinaryStorage = new CloudinaryStorage({
     cloudinary,
@@ -357,39 +364,30 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/stickerpacks', express.static(path.join(__dirname, 'stickerpacks')));
 
-const uploadSingle = upload.single('file');
-const uploadArray = upload.array('files', 20);
+const uploadFields = upload.fields([
+    { name: 'file', maxCount: 20 },
+    { name: 'files', maxCount: 20 },
+    { name: 'photo', maxCount: 20 },
+    { name: 'photos', maxCount: 20 },
+    { name: 'upload', maxCount: 20 },
+]);
 
-function handleUploadMiddleware(req, res, next) {
-    uploadArray(req, res, (arrayErr) => {
-        if (arrayErr) {
-            return next(arrayErr);
-        }
-
-        if (req.files && req.files.length > 0) {
-            return next();
-        }
-
-        uploadSingle(req, res, (singleErr) => {
-            if (singleErr) {
-                return next(singleErr);
-            }
-            next();
-        });
-    });
-}
-
-app.post('/api/upload', handleUploadMiddleware, async (req, res) => {
+async function handleFileUpload(req, res) {
     try {
         const files = [];
-        if (Array.isArray(req.files) && req.files.length > 0) {
+        if (Array.isArray(req.files)) {
             files.push(...req.files);
+        } else if (req.files && typeof req.files === 'object') {
+            Object.values(req.files).forEach((fileArray) => {
+                if (Array.isArray(fileArray)) files.push(...fileArray);
+            });
         }
         if (req.file) {
             files.push(req.file);
         }
 
         if (!files.length) {
+            console.warn('Upload handler received no files:', { body: req.body, files: req.files, file: req.file });
             return res.status(400).json({ error: 'No files uploaded. Use file or files fields.' });
         }
 
@@ -420,7 +418,10 @@ app.post('/api/upload', handleUploadMiddleware, async (req, res) => {
         console.error('Upload handler failed:', err);
         return res.status(500).json({ error: 'Failed to upload files.' });
     }
-});
+}
+
+app.post('/api/upload', uploadFields, handleFileUpload);
+app.post('/upload', uploadFields, handleFileUpload);
 
 app.get('/api/files', async (req, res) => {
     try {
