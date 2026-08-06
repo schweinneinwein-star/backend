@@ -28,16 +28,15 @@ if (envLoadedFrom) {
   console.warn('No .env file found in server root or uploads directory; relying on process.env values only.');
 }
 
-const CLOUDINARY_URL = process.env.CLOUDINARY_URL?.trim();
-const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME?.trim();
-const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY?.trim();
-const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET?.trim();
-const missingCloudinaryVars = !CLOUDINARY_URL && (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET);
-const cloudinaryConfigured = !!CLOUDINARY_URL || (!missingCloudinaryVars);
+const CLOUDINARY_URL = process.env.CLOUDINARY_URL?.trim() || null;
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME?.trim() || null;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY?.trim() || null;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET?.trim() || null;
+const cloudinaryConfigured = !!CLOUDINARY_URL || (!!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY && !!CLOUDINARY_API_SECRET);
 
 if (CLOUDINARY_URL) {
     cloudinary.config({ cloudinary_url: CLOUDINARY_URL, secure: true });
-} else if (!missingCloudinaryVars) {
+} else if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
     cloudinary.config({
         cloud_name: CLOUDINARY_CLOUD_NAME,
         api_key: CLOUDINARY_API_KEY,
@@ -45,6 +44,14 @@ if (CLOUDINARY_URL) {
         secure: true,
     });
 }
+
+console.log('Cloudinary config status:', {
+    cloudinaryConfigured,
+    CLOUDINARY_URL: CLOUDINARY_URL ? '[set]' : '[missing]',
+    CLOUDINARY_CLOUD_NAME: CLOUDINARY_CLOUD_NAME ? '[set]' : '[missing]',
+    CLOUDINARY_API_KEY: CLOUDINARY_API_KEY ? '[set]' : '[missing]',
+    CLOUDINARY_API_SECRET: CLOUDINARY_API_SECRET ? '[set]' : '[missing]',
+});
 
 if (!cloudinaryConfigured) {
     console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET.');
@@ -734,8 +741,20 @@ function removePackFromAllCollections(packName) {
     if (changed) saveUsers(users);
 }
 
-let onlineUsers = {}; 
-let userChatFocus = {}; 
+let onlineUsers = {};
+let userChatFocus = {};
+
+function attachSocketPhone(socket, phone) {
+    if (!socket || !phone) return false;
+    const normalizedPhone = String(phone).trim();
+    if (!normalizedPhone) return false;
+
+    socket.phone = normalizedPhone;
+    onlineUsers[normalizedPhone] = socket.id;
+    console.log(`✅ Socket ${socket.id} attached to phone ${normalizedPhone}`);
+    broadcastChatList(normalizedPhone);
+    return true;
+}
 
 function broadcastChatList(userPhone) {
     const socketId = onlineUsers[userPhone];
@@ -858,8 +877,7 @@ io.on('connection', (socket) => {
         );
 
         if (user) {
-            socket.phone = user.phone;
-            onlineUsers[user.phone] = socket.id;
+            attachSocketPhone(socket, user.phone);
             socket.join(token);
             
             console.log(`✅ Сессия подтверждена для: ${user.phone}`);
@@ -878,6 +896,26 @@ io.on('connection', (socket) => {
         } else {
             socket.emit('session_invalid');
         }
+    });
+
+    socket.on('user_connected', (data) => {
+        const phone = data?.phone || data?.sender || data?.senderPhone || data?.userPhone;
+        if (!phone) {
+            socket.emit('auth_error', 'Missing phone in user_connected payload');
+            return;
+        }
+        attachSocketPhone(socket, phone);
+        socket.emit('user_connected_success', { phone: socket.phone });
+    });
+
+    socket.on('auth', (data) => {
+        const phone = data?.phone || data?.sender || data?.senderPhone || data?.userPhone;
+        if (!phone) {
+            socket.emit('auth_error', 'Missing phone in auth payload');
+            return;
+        }
+        attachSocketPhone(socket, phone);
+        socket.emit('auth_success', { phone: socket.phone });
     });
 
     socket.on('request_user_sessions', async (data) => {
@@ -1315,8 +1353,12 @@ socket.on('update_profile', async (data) => {
             return;
         }
 
-        const senderPhone = socket.phone || data.sender;
-        const recipientPhone = data.recipientPhone || data.recipient || data.roomId;
+        const senderPhone = socket.phone || data?.sender || data?.senderPhone || data?.userPhone || data?.phone;
+        const recipientPhone = data?.recipientPhone || data?.recipient || data?.to || data?.roomId;
+        if (!senderPhone) {
+            console.warn('❗ send_private_message rejected: missing senderPhone', { socketPhone: socket.phone, payload: data });
+            return;
+        }
         if (!recipientPhone) {
             console.warn('❗ send_private_message rejected: missing recipientPhone', data);
             return;
