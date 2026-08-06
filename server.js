@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
@@ -5,6 +6,9 @@ const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
 const twilio = require('twilio');
+const multer = require('multer');
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const cloudinary = require('cloudinary').v2;
 
 // Ключи Twilio
 const twilioClient = twilio('AC26eabfcf1d37dec04bdacd675d721d47', '21c947e54570fe0392fe88c49edb2365');
@@ -16,6 +20,32 @@ const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
+
+if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+    console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.');
+}
+
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true,
+});
+
+const cloudinaryStorage = new CloudinaryStorage({
+    cloudinary,
+    params: {
+        folder: 'sparkle_uploads',
+        resource_type: 'auto',
+    },
+});
+
+const upload = multer({
+    storage: cloudinaryStorage,
+    limits: {
+        fileSize: 150 * 1024 * 1024, // 150 MB limit per file
+    },
+});
 
 const app = express();
 const server = http.createServer(app);
@@ -167,6 +197,15 @@ const messageSchema = new mongoose.Schema({
     read: { type: Boolean, default: false }
 }, { timestamps: true });
 
+const uploadFileSchema = new mongoose.Schema({
+    url: { type: String, required: true },
+    publicId: { type: String, required: true },
+    resourceType: { type: String, required: true },
+    originalName: { type: String, required: true },
+    size: { type: Number, required: true },
+    createdAt: { type: Date, default: Date.now },
+}, { timestamps: true });
+
 const groupSchema = new mongoose.Schema({
     id: { type: String, required: true, unique: true },
     type: { type: String, default: 'group' },
@@ -209,6 +248,7 @@ const userSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const Message = mongoose.models.Message || mongoose.model('Message', messageSchema);
+const UploadFile = mongoose.models.UploadFile || mongoose.model('UploadFile', uploadFileSchema);
 const Group = mongoose.models.Group || mongoose.model('Group', groupSchema);
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
@@ -316,6 +356,129 @@ app.get('/', (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/stickerpacks', express.static(path.join(__dirname, 'stickerpacks')));
+
+const uploadSingle = upload.single('file');
+const uploadArray = upload.array('files', 20);
+
+function handleUploadMiddleware(req, res, next) {
+    uploadArray(req, res, (arrayErr) => {
+        if (arrayErr) {
+            return next(arrayErr);
+        }
+
+        if (req.files && req.files.length > 0) {
+            return next();
+        }
+
+        uploadSingle(req, res, (singleErr) => {
+            if (singleErr) {
+                return next(singleErr);
+            }
+            next();
+        });
+    });
+}
+
+app.post('/api/upload', handleUploadMiddleware, async (req, res) => {
+    try {
+        const files = [];
+        if (Array.isArray(req.files) && req.files.length > 0) {
+            files.push(...req.files);
+        }
+        if (req.file) {
+            files.push(req.file);
+        }
+
+        if (!files.length) {
+            return res.status(400).json({ error: 'No files uploaded. Use file or files fields.' });
+        }
+
+        const savedFiles = [];
+        for (const file of files) {
+            const url = file.path || file.secure_url || file.url;
+            const publicId = file.filename || file.public_id || file.publicId;
+            const resourceType = file.resource_type || file.mimetype?.split('/')[0] || 'raw';
+            const originalName = file.originalname || file.name || 'unknown';
+            const size = Number(file.size || file.bytes || 0);
+
+            if (!url || !publicId) {
+                return res.status(500).json({ error: 'Uploaded file is missing Cloudinary metadata.' });
+            }
+
+            const savedFile = await UploadFile.create({
+                url,
+                publicId,
+                resourceType,
+                originalName,
+                size,
+            });
+            savedFiles.push(savedFile);
+        }
+
+        return res.status(201).json({ files: savedFiles });
+    } catch (err) {
+        console.error('Upload handler failed:', err);
+        return res.status(500).json({ error: 'Failed to upload files.' });
+    }
+});
+
+app.get('/api/files', async (req, res) => {
+    try {
+        const files = await UploadFile.find().sort({ createdAt: -1 }).lean();
+        return res.json({ files });
+    } catch (err) {
+        console.error('Failed to fetch files:', err);
+        return res.status(500).json({ error: 'Failed to fetch files.' });
+    }
+});
+
+app.get('/api/files/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ error: 'Invalid file ID.' });
+        }
+
+        const file = await UploadFile.findById(id).lean();
+        if (!file) {
+            return res.status(404).json({ error: 'File not found.' });
+        }
+
+        return res.json({ file });
+    } catch (err) {
+        console.error('Failed to fetch file:', err);
+        return res.status(500).json({ error: 'Failed to fetch file.' });
+    }
+});
+
+app.delete('/api/files/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ error: 'Invalid file ID.' });
+        }
+
+        const file = await UploadFile.findById(id);
+        if (!file) {
+            return res.status(404).json({ error: 'File not found.' });
+        }
+
+        try {
+            await cloudinary.uploader.destroy(file.publicId, {
+                resource_type: file.resourceType || 'auto',
+            });
+        } catch (destroyErr) {
+            console.error('Cloudinary destroy error:', destroyErr);
+            return res.status(500).json({ error: 'Failed to delete asset from Cloudinary.' });
+        }
+
+        await file.deleteOne();
+        return res.json({ success: true, id });
+    } catch (err) {
+        console.error('Failed to delete file:', err);
+        return res.status(500).json({ error: 'Failed to delete file.' });
+    }
+});
 
 app.get('/groups', async (req, res) => {
     try {
