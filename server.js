@@ -1,4 +1,4 @@
-require('dotenv').config();
+const dotenv = require('dotenv');
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
@@ -7,52 +7,100 @@ const path = require('path');
 const fs = require('fs');
 const twilio = require('twilio');
 const multer = require('multer');
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const cloudinary = require('cloudinary').v2;
 
-// Ключи Twilio
-const twilioClient = twilio('AC26eabfcf1d37dec04bdacd675d721d47', '21c947e54570fe0392fe88c49edb2365');
-const TWILIO_PHONE = '+19163148186';
-
-let pendingCodes = {}; 
-let ipRateLimits = {}; 
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const rootEnvPath = path.join(__dirname, '.env');
+const uploadEnvPath = path.join(__dirname, 'uploads', '.env');
+let envLoadedFrom = null;
+if (fs.existsSync(rootEnvPath)) {
+  dotenv.config({ path: rootEnvPath });
+  envLoadedFrom = rootEnvPath;
+} else if (fs.existsSync(uploadEnvPath)) {
+  dotenv.config({ path: uploadEnvPath });
+  envLoadedFrom = uploadEnvPath;
+} else {
+  const fallback = dotenv.config();
+  if (!fallback.error) envLoadedFrom = 'default .env location';
+}
+if (envLoadedFrom) {
+  console.log(`Loaded environment variables from ${envLoadedFrom}`);
+} else {
+  console.warn('No .env file found in server root or uploads directory; relying on process.env values only.');
 }
 
-const missingCloudinaryVars = !process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET;
+const CLOUDINARY_URL = process.env.CLOUDINARY_URL?.trim();
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY?.trim();
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET?.trim();
+const missingCloudinaryVars = !CLOUDINARY_URL && (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET);
+const cloudinaryConfigured = !!CLOUDINARY_URL || (!missingCloudinaryVars);
 
-if (process.env.CLOUDINARY_URL) {
-    cloudinary.config(process.env.CLOUDINARY_URL);
-    cloudinary.config({ secure: true });
-} else {
+if (CLOUDINARY_URL) {
+    cloudinary.config({ cloudinary_url: CLOUDINARY_URL, secure: true });
+} else if (!missingCloudinaryVars) {
     cloudinary.config({
-        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-        api_key: process.env.CLOUDINARY_API_KEY,
-        api_secret: process.env.CLOUDINARY_API_SECRET,
+        cloud_name: CLOUDINARY_CLOUD_NAME,
+        api_key: CLOUDINARY_API_KEY,
+        api_secret: CLOUDINARY_API_SECRET,
         secure: true,
     });
 }
 
-if (missingCloudinaryVars && !process.env.CLOUDINARY_URL) {
-    console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET or CLOUDINARY_URL.');
+if (!cloudinaryConfigured) {
+    console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET.');
 }
 
-const cloudinaryStorage = new CloudinaryStorage({
-    cloudinary,
-    params: {
-        folder: 'sparkle_uploads',
-        resource_type: 'auto',
-    },
-});
-
 const upload = multer({
-    storage: cloudinaryStorage,
+    storage: multer.memoryStorage(),
     limits: {
         fileSize: 150 * 1024 * 1024, // 150 MB limit per file
     },
 });
+
+async function uploadBufferToCloudinary(file) {
+    if (!file || !file.buffer) {
+        throw new Error('No buffer data available for Cloudinary upload.');
+    }
+
+    return new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+            {
+                folder: 'sparkle_uploads',
+                resource_type: 'auto',
+            },
+            (error, result) => {
+                if (error) {
+                    return reject(error);
+                }
+                resolve(result);
+            }
+        );
+
+        uploadStream.end(file.buffer);
+    });
+}
+
+function ensureLocalUploadDirectory() {
+    const localUploadPath = path.join(UPLOADS_DIR, 'local');
+    if (!fs.existsSync(localUploadPath)) {
+        fs.mkdirSync(localUploadPath, { recursive: true });
+    }
+    return localUploadPath;
+}
+
+async function saveFileLocally(file) {
+    const localUploadPath = ensureLocalUploadDirectory();
+    const safeName = `${Date.now()}_${file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_')}`;
+    const filePath = path.join(localUploadPath, safeName);
+    await fs.promises.writeFile(filePath, file.buffer);
+    return {
+        url: `/uploads/local/${safeName}`,
+        publicId: `local_${safeName}`,
+        resourceType: (file.mimetype || 'application/octet-stream').split('/')[0] || 'raw',
+        originalName: file.originalname || safeName,
+        size: file.size || file.buffer.length || 0,
+    };
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -364,13 +412,22 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/stickerpacks', express.static(path.join(__dirname, 'stickerpacks')));
 
-const uploadFields = upload.fields([
-    { name: 'file', maxCount: 20 },
-    { name: 'files', maxCount: 20 },
-    { name: 'photo', maxCount: 20 },
-    { name: 'photos', maxCount: 20 },
-    { name: 'upload', maxCount: 20 },
-]);
+const uploadAny = upload.any();
+
+function uploadAnyMiddleware(req, res, next) {
+    uploadAny(req, res, (err) => {
+        if (err) {
+            console.error('Multer upload error:', err);
+            const statusCode = err instanceof multer.MulterError ? 400 : 500;
+            return res.status(statusCode).json({
+                error: err.message || 'File upload failed.',
+                code: err.code || 'UPLOAD_ERROR',
+                details: err.toString ? err.toString() : err,
+            });
+        }
+        next();
+    });
+}
 
 async function handleFileUpload(req, res) {
     try {
@@ -393,14 +450,35 @@ async function handleFileUpload(req, res) {
 
         const savedFiles = [];
         for (const file of files) {
-            const url = file.path || file.secure_url || file.url;
-            const publicId = file.filename || file.public_id || file.publicId;
-            const resourceType = file.resource_type || file.mimetype?.split('/')[0] || 'raw';
-            const originalName = file.originalname || file.name || 'unknown';
-            const size = Number(file.size || file.bytes || 0);
+            const originalName = file.originalname || file.name || `upload_${Date.now()}`;
+            const resourceType = (file.mimetype || 'application/octet-stream').split('/')[0] || 'raw';
+            const size = Number(file.size || file.buffer?.length || 0);
+            let uploadResult;
+            let url;
+            let publicId;
+            let source = 'cloudinary';
+
+            if (cloudinaryConfigured) {
+                try {
+                    uploadResult = await uploadBufferToCloudinary(file);
+                    url = uploadResult.secure_url || uploadResult.url;
+                    publicId = uploadResult.public_id || uploadResult.publicId;
+                } catch (uploadErr) {
+                    console.warn('Cloudinary upload failed, falling back to local storage:', uploadErr.message || uploadErr);
+                    source = 'local';
+                }
+            } else {
+                source = 'local';
+            }
+
+            if (source === 'local') {
+                const localResult = await saveFileLocally(file);
+                url = localResult.url;
+                publicId = localResult.publicId;
+            }
 
             if (!url || !publicId) {
-                return res.status(500).json({ error: 'Uploaded file is missing Cloudinary metadata.' });
+                return res.status(500).json({ error: 'Failed to save uploaded file.' });
             }
 
             const savedFile = await UploadFile.create({
@@ -416,12 +494,12 @@ async function handleFileUpload(req, res) {
         return res.status(201).json({ files: savedFiles });
     } catch (err) {
         console.error('Upload handler failed:', err);
-        return res.status(500).json({ error: 'Failed to upload files.' });
+        return res.status(500).json({ error: err.message || 'Failed to upload files.' });
     }
 }
 
-app.post('/api/upload', uploadFields, handleFileUpload);
-app.post('/upload', uploadFields, handleFileUpload);
+app.post('/api/upload', uploadAnyMiddleware, handleFileUpload);
+app.post('/upload', uploadAnyMiddleware, handleFileUpload);
 
 app.get('/api/files', async (req, res) => {
     try {
@@ -479,6 +557,19 @@ app.delete('/api/files/:id', async (req, res) => {
         console.error('Failed to delete file:', err);
         return res.status(500).json({ error: 'Failed to delete file.' });
     }
+});
+
+app.use((err, req, res, next) => {
+    console.error('Unhandled server error:', err);
+    if (res.headersSent) {
+        return next(err);
+    }
+
+    const statusCode = err && err.status ? err.status : 500;
+    return res.status(statusCode).json({
+        error: err && err.message ? err.message : 'Internal server error.',
+        code: err && err.code ? err.code : 'INTERNAL_SERVER_ERROR',
+    });
 });
 
 app.get('/groups', async (req, res) => {
@@ -1083,7 +1174,7 @@ socket.on('user_registered', async (userData) => {
 
         // Сохраняем аватар если есть
         if (userData.avatarBase64) {
-            const newUrl = saveBase64Image(userData.avatarBase64, userData.phone, 'avatar');
+            const newUrl = await saveBase64Image(userData.avatarBase64, userData.phone, 'avatar');
             if (newUrl) user.avatarUrl = newUrl;
         }
 
@@ -1115,12 +1206,12 @@ socket.on('update_profile', async (data) => {
 
         // Обновляем поля
         if (data.avatarBase64) {
-            const newUrl = saveBase64Image(data.avatarBase64, userPhone, 'avatar');
+            const newUrl = await saveBase64Image(data.avatarBase64, userPhone, 'avatar');
             if (newUrl) user.avatarUrl = newUrl;
         }
 
         if (data.bannerBase64) {
-            const newUrl = saveBase64Image(data.bannerBase64, userPhone, 'banner');
+            const newUrl = await saveBase64Image(data.bannerBase64, userPhone, 'banner');
             if (newUrl) user.bannerUrl = newUrl;
         }
 
@@ -1230,7 +1321,7 @@ socket.on('update_profile', async (data) => {
 
         let mediaUrl = null;
         if (data.mediaBase64) {
-            mediaUrl = saveBase64Image(data.mediaBase64, senderPhone, `chat_${Date.now()}`);
+            mediaUrl = await saveBase64Image(data.mediaBase64, senderPhone, `chat_${Date.now()}`);
             if (!mediaUrl) return;
         }
 
@@ -1931,34 +2022,57 @@ function saveBase64ToDir(base64Data, targetDir, fileName) {
     }
 }
 
-function saveBase64Image(base64Data, phone, type) {
+async function uploadBase64ToCloudinary(base64Data, fileName) {
+    if (!cloudinaryConfigured) return null;
+
+    try {
+        const result = await cloudinary.uploader.upload(base64Data, {
+            folder: 'sparkle_uploads',
+            public_id: fileName,
+            resource_type: 'auto',
+            overwrite: true,
+        });
+        return result.secure_url || result.url || null;
+    } catch (err) {
+        console.error('Cloudinary base64 upload failed:', err);
+        return null;
+    }
+}
+
+async function saveBase64Image(base64Data, phone, type) {
     try {
         const matches = base64Data.match(/^data:(.*?);base64,(.+)$/);
         if (!matches || matches.length !== 3) {
-            console.log("❌ Ошибка парсинга файла: неверный формат base64");
-            return null; 
+            console.log('❌ Ошибка парсинга файла: неверный формат base64');
+            return null;
         }
 
         const mimeType = matches[1];
-        const base64String = matches[2];
         let extension = 'bin';
-        
         if (mimeType.includes('jpeg') || mimeType.includes('jpg')) extension = 'jpg';
         else if (mimeType.includes('png')) extension = 'png';
         else if (mimeType.includes('mp4')) extension = 'mp4';
-        else if (mimeType.includes('quicktime')) extension = 'mp4'; 
+        else if (mimeType.includes('quicktime')) extension = 'mp4';
         else if (mimeType.includes('webm')) extension = 'webm';
         else extension = mimeType.split('/')[1] || 'bin';
 
-        const buffer = Buffer.from(base64String, 'base64');
         const cleanPhone = phone.replace('+', '');
-        const fileName = `${cleanPhone}_${type}.${extension}`;
-        const filePath = path.join(UPLOADS_DIR, fileName);
+        const fileName = `${cleanPhone}_${type}`;
 
+        if (cloudinaryConfigured) {
+            const uploadedUrl = await uploadBase64ToCloudinary(base64Data, fileName);
+            if (uploadedUrl) return uploadedUrl;
+            console.warn('Cloudinary upload failed, falling back to local file save for base64 asset');
+        }
+
+        const base64String = matches[2];
+        const buffer = Buffer.from(base64String, 'base64');
+        const localFileName = `${fileName}.${extension}`;
+        const filePath = path.join(UPLOADS_DIR, localFileName);
         fs.writeFileSync(filePath, buffer);
-        return `/uploads/${fileName}?t=${Date.now()}`; 
+        return `/uploads/${localFileName}?t=${Date.now()}`;
     } catch (e) {
-        console.error("❌ Ошибка при сохранении файла:", e);
+        console.error('❌ Ошибка при сохранении файла:', e);
         return null;
     }
 }
