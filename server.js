@@ -158,6 +158,7 @@ const messageSchema = new mongoose.Schema({
     roomId: { type: String, default: null },
     type: { type: String, default: 'text' },
     mediaUrl: { type: String, default: null },
+    mediaUrls: { type: [String], default: [] },
     isVideo: { type: Boolean, default: false },
     stickerUrl: { type: String, default: null },
     stickerName: { type: String, default: null },
@@ -1049,7 +1050,8 @@ socket.on('update_profile', async (data) => {
             return;
         }
 
-        if (!data || (!data.text && !data.mediaBase64 && data.type !== 'call_log' && data.type !== 'sticker')) {
+        const hasMediaUrls = Array.isArray(data?.mediaUrls) && data.mediaUrls.length > 0;
+        if (!data || (!data.text && !data.mediaBase64 && !data.mediaUrl && !hasMediaUrls && data.type !== 'call_log' && data.type !== 'sticker' && data.type !== 'image')) {
             return;
         }
 
@@ -1079,7 +1081,8 @@ socket.on('update_profile', async (data) => {
             stickerUrl: data.stickerUrl || null,
             stickerName: data.stickerName || null,
             packName: data.packName || null,
-            mediaUrl,
+            mediaUrl: data.mediaUrl || mediaUrl,
+            mediaUrls: Array.isArray(data.mediaUrls) ? data.mediaUrls.map(String) : [],
             isVideo: !!data.isVideo,
             timestamp: data.timestamp ? new Date(data.timestamp) : new Date(),
             read: false,
