@@ -50,6 +50,11 @@ if (!cloudinaryConfigured) {
     console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET.');
 }
 
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const pendingCodes = {};
+const ipRateLimits = {};
+
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
@@ -2067,10 +2072,11 @@ async function saveBase64Image(base64Data, phone, type) {
 
         const base64String = matches[2];
         const buffer = Buffer.from(base64String, 'base64');
+        const localUploadPath = ensureLocalUploadDirectory();
         const localFileName = `${fileName}.${extension}`;
-        const filePath = path.join(UPLOADS_DIR, localFileName);
+        const filePath = path.join(localUploadPath, localFileName);
         fs.writeFileSync(filePath, buffer);
-        return `/uploads/${localFileName}?t=${Date.now()}`;
+        return `/uploads/local/${localFileName}?t=${Date.now()}`;
     } catch (e) {
         console.error('❌ Ошибка при сохранении файла:', e);
         return null;
