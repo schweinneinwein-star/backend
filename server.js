@@ -1001,15 +1001,99 @@ app.post('/api/channels/:id/ban', async (req, res) => {
     }
 });
 
+app.get('/api/channels', async (req, res) => {
+    try {
+        const subscribedPhone = req.query.subscribedPhone;
+        if (!subscribedPhone) {
+            return res.status(400).json({ error: 'subscribedPhone query parameter is required' });
+        }
+
+        const user = await User.findOne({ phone: String(subscribedPhone).trim() });
+        if (!user) {
+            return res.json({ channels: [] });
+        }
+
+        const channels = await Channel.find({ subscribers: user._id }).sort({ createdAt: -1 }).lean();
+        return res.json({ channels });
+    } catch (err) {
+        console.error('Failed to list subscribed channels:', err);
+        res.status(500).json({ error: 'Failed to list subscribed channels' });
+    }
+});
+
 app.get('/api/channels/search', async (req, res) => {
     try {
         const q = (req.query.q || '').trim();
         if (!q) return res.json({ results: [] });
-        const results = await Channel.find({ $text: { $search: q }, type: 'public' }).limit(50).lean();
-        return res.json({ results });
+
+        const safeQuery = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(safeQuery, 'i');
+
+        const results = await Channel.find({
+            type: 'public',
+            $or: [
+                { $text: { $search: q } },
+                { username: regex },
+                { name: regex },
+                { description: regex },
+            ],
+        }).limit(50).lean();
+
+        const formatted = results.map((channel) => ({
+            _id: channel._id,
+            name: channel.name,
+            description: channel.description,
+            username: channel.username,
+            avatar: channel.avatar,
+            banner: channel.banner,
+            subscriberCount: Array.isArray(channel.subscribers) ? channel.subscribers.length : 0,
+        }));
+
+        return res.json({ results: formatted });
     } catch (err) {
         console.error('Channel search error:', err);
         res.status(500).json({ error: 'Search failed' });
+    }
+});
+
+app.get('/api/channels/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid channel id' });
+
+        const channel = await Channel.findById(id).lean();
+        if (!channel) return res.status(404).json({ error: 'Channel not found' });
+
+        const posts = await ChannelPost.find({ channelId: channel._id }).sort({ isPinned: -1, createdAt: -1 }).lean();
+        const userPhone = req.query.userPhone ? String(req.query.userPhone).trim() : null;
+        let isSubscriber = false;
+        let isAdmin = false;
+        let isOwner = false;
+
+        if (userPhone) {
+            const user = await User.findOne({ phone: userPhone });
+            if (user) {
+                isSubscriber = Array.isArray(channel.subscribers) && channel.subscribers.some((sub) => String(sub) === String(user._id));
+                isOwner = String(channel.owner) === String(user._id);
+                isAdmin = isOwner || Array.isArray(channel.admins) && channel.admins.some((a) => String(a.user) === String(user._id));
+            }
+        }
+
+        const result = {
+            channel: {
+                ...channel,
+                isSubscriber,
+                isOwner,
+                isAdmin,
+                subscriberCount: Array.isArray(channel.subscribers) ? channel.subscribers.length : 0,
+            },
+            posts,
+        };
+
+        return res.json(result);
+    } catch (err) {
+        console.error('Failed to fetch channel details:', err);
+        res.status(500).json({ error: 'Failed to fetch channel details' });
     }
 });
 
