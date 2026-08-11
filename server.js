@@ -337,6 +337,7 @@ const channelSchema = new mongoose.Schema({
     name: { type: String, required: true, trim: true, maxlength: 64 },
     description: { type: String, default: null, maxlength: 255 },
     avatar: { type: String, default: null }, // Cloudinary URL
+    banner: { type: String, default: null }, // Cloudinary URL for channel cover
     username: { type: String, default: null, sparse: true, unique: true }, // public @username
     type: { type: String, enum: ['public', 'private'], default: 'public' },
     inviteLink: { type: String, default: null },
@@ -730,7 +731,7 @@ async function saveAvatarFile(file) {
 
 app.post('/api/channels', uploadAnyMiddleware, async (req, res) => {
     try {
-        const { name, description, type, ownerPhone, ownerId } = req.body;
+        const { name, description, type, ownerPhone, ownerId, inviteLink, restrictedContent, username } = req.body;
         if (!name) return res.status(400).json({ error: 'name is required' });
 
         let owner = null;
@@ -742,25 +743,43 @@ app.post('/api/channels', uploadAnyMiddleware, async (req, res) => {
         if (!owner) return res.status(400).json({ error: 'owner not found (provide ownerId or ownerPhone)' });
 
         let avatarUrl = req.body.avatarUrl || null;
+        let bannerUrl = req.body.bannerUrl || null;
         if (req.files && req.files.length) {
-            // prefer first file as avatar
-            avatarUrl = await saveAvatarFile(req.files[0]);
+            for (const file of req.files) {
+                const fieldName = (file.fieldname || '').toString().toLowerCase();
+                if (fieldName === 'avatar') {
+                    avatarUrl = await saveAvatarFile(file);
+                } else if (fieldName === 'banner') {
+                    try {
+                        const uploadResult = await uploadBufferToCloudinary(file);
+                        bannerUrl = uploadResult.secure_url || uploadResult.url;
+                    } catch (err) {
+                        console.warn('Banner upload failed, falling back to local save:', err.message || err);
+                        const localResult = await saveFileLocally(file);
+                        bannerUrl = localResult.url;
+                    }
+                } else if (!avatarUrl) {
+                    avatarUrl = await saveAvatarFile(file);
+                }
+            }
         }
 
-        const inviteLink = req.body.inviteLink || null;
         const channel = await Channel.create({
-            name,
+            name: String(name).trim(),
             description: description || null,
-            avatarUrl,
+            avatar: avatarUrl || null,
+            banner: bannerUrl || null,
+            username: username ? String(username).trim() : null,
             type: type === 'private' ? 'private' : 'public',
-            inviteLink,
+            inviteLink: inviteLink || (type === 'private' ? `sparkle.me/join/${Math.random().toString(36).slice(2, 10)}` : null),
+            owner: owner._id,
+            admins: [{ user: owner._id, permissions: { canPost: true, canEdit: true, canDelete: true, canAddAdmins: true } }],
             subscribers: [owner._id],
-            admins: [owner._id],
-            ownerId: owner._id,
+            bannedUsers: [],
+            restrictedContent: !!restrictedContent,
         });
 
         const channelObj = channel.toObject();
-        // Notify via socket
         try { io.emit('channel_created', channelObj); } catch (e) { /* ignore */ }
         return res.status(201).json(channelObj);
     } catch (err) {
@@ -812,7 +831,7 @@ app.post('/api/channels/:id/leave', async (req, res) => {
         if (!user) return res.status(400).json({ error: 'User not found' });
 
         channel.subscribers = channel.subscribers.filter(s => !s.equals(user._id));
-        channel.admins = channel.admins.filter(a => !a.equals(user._id));
+        channel.admins = channel.admins.filter(a => String(a.user) !== String(user._id));
         await channel.save();
         try { io.to(String(channel._id)).emit('channel_left', { channelId: channel._id, userId: user._id }); } catch (e) {}
         return res.json({ success: true });
@@ -836,7 +855,7 @@ app.post('/api/channels/:id/posts', uploadAnyMiddleware, async (req, res) => {
         if (!author) return res.status(400).json({ error: 'Author not found' });
 
         // Check rights: owner or admin
-        const isAdmin = channel.ownerId.equals(author._id) || (channel.admins || []).some(a => a.equals(author._id));
+        const isAdmin = channel.owner.equals(author._id) || (channel.admins || []).some(a => String(a.user) === String(author._id));
         if (!isAdmin) return res.status(403).json({ error: 'Only owner or admins can post' });
 
         const mediaUrls = [];
@@ -887,7 +906,7 @@ app.post('/api/channels/:id/posts/:postId/pin', async (req, res) => {
         if (!channel) return res.status(404).json({ error: 'Channel not found' });
         const user = userId && mongoose.Types.ObjectId.isValid(userId) ? await User.findById(userId) : null;
         if (!user) return res.status(400).json({ error: 'User not found' });
-        const isAdmin = channel.ownerId.equals(user._id) || (channel.admins || []).some(a => a.equals(user._id));
+        const isAdmin = channel.owner.equals(user._id) || (channel.admins || []).some(a => String(a.user) === String(user._id));
         if (!isAdmin) return res.status(403).json({ error: 'Not authorized' });
         await ChannelPost.updateMany({ channelId: channel._id }, { $set: { isPinned: false } });
         await ChannelPost.findByIdAndUpdate(postId, { isPinned: true });
@@ -969,10 +988,10 @@ app.post('/api/channels/:id/ban', async (req, res) => {
         const byUser = await User.findById(byUserId);
         if (!byUser) return res.status(400).json({ error: 'By user not found' });
         // only owner can ban
-        if (!channel.ownerId.equals(byUser._id)) return res.status(403).json({ error: 'Only owner can ban users' });
+        if (!channel.owner.equals(byUser._id)) return res.status(403).json({ error: 'Only owner can ban users' });
         if (!channel.bannedUsers.some(b => b.equals(targetUserId))) channel.bannedUsers.push(targetUserId);
         channel.subscribers = channel.subscribers.filter(s => !s.equals(targetUserId));
-        channel.admins = channel.admins.filter(a => !a.equals(targetUserId));
+        channel.admins = channel.admins.filter(a => String(a.user) !== String(targetUserId));
         await channel.save();
         try { io.to(String(id)).emit('channel_user_banned', { channelId: id, userId: targetUserId }); } catch (e) {}
         return res.json({ success: true });
@@ -2521,12 +2540,14 @@ socket.on('update_profile', async (data) => {
             const channel = await Channel.create({
                 name: data.name,
                 description: data.description || null,
-                avatarUrl,
+                avatar: avatarUrl,
                 type: data.type === 'private' ? 'private' : 'public',
                 inviteLink: data.inviteLink || null,
+                owner: owner._id,
+                admins: [{ user: owner._id, permissions: { canPost: true, canEdit: true, canDelete: true, canAddAdmins: true } }],
                 subscribers: [owner._id],
-                admins: [owner._id],
-                ownerId: owner._id,
+                bannedUsers: [],
+                restrictedContent: !!data.restrictedContent,
             });
 
             const ch = channel.toObject();
@@ -2602,7 +2623,7 @@ socket.on('update_profile', async (data) => {
             const author = await User.findOne({ phone: authorPhone });
             if (!author) return socket.emit('channel_error', 'Author not found');
 
-            const isAdmin = String(channel.ownerId) === String(author._id) || (channel.admins || []).some(a => String(a) === String(author._id));
+            const isAdmin = String(channel.owner) === String(author._id) || (channel.admins || []).some(a => String(a.user) === String(author._id));
             if (!isAdmin) return socket.emit('channel_error', 'Only owner or admins can create posts');
 
             const mediaUrls = Array.isArray(data.media) ? data.media : (data.media ? [data.media] : []);
@@ -2627,8 +2648,8 @@ socket.on('update_profile', async (data) => {
             // only author, admin or owner can delete
             const user = await User.findOne({ phone: socket.phone });
             if (!user) return socket.emit('channel_error', 'Not authenticated');
-            const isOwner = channel.ownerId && String(channel.ownerId) === String(user._id);
-            const isAdmin = (channel.admins || []).some(a => String(a) === String(user._id));
+            const isOwner = channel.owner && String(channel.owner) === String(user._id);
+            const isAdmin = (channel.admins || []).some(a => String(a.user) === String(user._id));
             if (!isOwner && !isAdmin && String(post.authorId) !== String(user._id)) return socket.emit('channel_error', 'Not authorized');
             await post.deleteOne();
             io.to(String(channel._id)).emit('channel_post_deleted', { postId });
@@ -2647,7 +2668,7 @@ socket.on('update_profile', async (data) => {
             if (!channel) return socket.emit('channel_error', 'Channel not found');
             const user = await User.findOne({ phone: socket.phone });
             if (!user) return socket.emit('channel_error', 'Not authenticated');
-            const isAdmin = String(channel.ownerId) === String(user._id) || (channel.admins || []).some(a => String(a) === String(user._id));
+            const isAdmin = String(channel.owner) === String(user._id) || (channel.admins || []).some(a => String(a.user) === String(user._id));
             if (!isAdmin) return socket.emit('channel_error', 'Not authorized');
             await ChannelPost.updateMany({ channelId: channel._id }, { $set: { isPinned: false } });
             await ChannelPost.findByIdAndUpdate(postId, { isPinned: true });
@@ -2722,10 +2743,10 @@ socket.on('update_profile', async (data) => {
             if (!channel) return socket.emit('channel_error', 'Channel not found');
             const byUser = await User.findOne({ phone: socket.phone });
             if (!byUser) return socket.emit('channel_error', 'Not authenticated');
-            if (!channel.ownerId || String(channel.ownerId) !== String(byUser._id)) return socket.emit('channel_error', 'Only owner can ban');
+            if (!channel.owner || String(channel.owner) !== String(byUser._id)) return socket.emit('channel_error', 'Only owner can ban');
             if (!channel.bannedUsers.some(b => String(b) === String(targetUserId))) channel.bannedUsers.push(targetUserId);
             channel.subscribers = (channel.subscribers || []).filter(s => String(s) !== String(targetUserId));
-            channel.admins = (channel.admins || []).filter(a => String(a) !== String(targetUserId));
+            channel.admins = (channel.admins || []).filter(a => String(a.user) !== String(targetUserId));
             await channel.save();
             io.to(String(channelId)).emit('channel_user_banned', { channelId, userId: targetUserId });
             socket.emit('ban_user_success', { channelId, userId: targetUserId });
