@@ -332,37 +332,58 @@ const Group = mongoose.models.Group || mongoose.model('Group', groupSchema);
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
 // -------------------- Каналы (Channels) --------------------
+// Detailed Mongoose schemas aligned with requested specification
 const channelSchema = new mongoose.Schema({
-    name: { type: String, required: true },
-    description: { type: String, default: null },
-    avatarUrl: { type: String, default: null },
+    name: { type: String, required: true, trim: true, maxlength: 64 },
+    description: { type: String, default: null, maxlength: 255 },
+    avatar: { type: String, default: null }, // Cloudinary URL
+    username: { type: String, default: null, sparse: true, unique: true }, // public @username
     type: { type: String, enum: ['public', 'private'], default: 'public' },
     inviteLink: { type: String, default: null },
+    owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    admins: [{
+        user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        permissions: {
+            canPost: { type: Boolean, default: true },
+            canEdit: { type: Boolean, default: true },
+            canDelete: { type: Boolean, default: true },
+            canAddAdmins: { type: Boolean, default: false },
+        }
+    }],
     subscribers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-    admins: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-    ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     bannedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    restrictedContent: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
 // Text index for global search on public channels
 channelSchema.index({ name: 'text', description: 'text' });
+// Unique sparse index for username (public handles)
+channelSchema.index({ username: 1 }, { unique: true, sparse: true });
 
 const channelPostSchema = new mongoose.Schema({
     channelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Channel', required: true },
     authorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    content: { type: String, default: '' },
-    media: [{ type: String }], // Cloudinary URLs or local URLs
-    views: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }], // track unique viewers
-    reactions: [{ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, emoji: String }],
+    text: { type: String, default: '' },
+    media: [{
+        url: { type: String, required: true },
+        type: { type: String, enum: ['image', 'video', 'file', 'audio'], default: 'image' },
+        publicId: { type: String, default: null }
+    }],
+    views: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }], // unique viewers
+    reactions: [{ emoji: String, users: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }] }],
     isPinned: { type: Boolean, default: false },
+    isSilent: { type: Boolean, default: false },
+    scheduledAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
 const channelCommentSchema = new mongoose.Schema({
     postId: { type: mongoose.Schema.Types.ObjectId, ref: 'ChannelPost', required: true },
+    channelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Channel', required: true },
     authorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     text: { type: String, required: true },
+    mediaUrl: { type: String, default: null },
     createdAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -2007,6 +2028,402 @@ socket.on('update_profile', async (data) => {
                 targetPhone: socket.phone, 
                 deleteAt: comment.deleteAt 
             });
+        }
+    });
+
+    // ==================== CHANNELS (Socket handlers) ====================
+
+    // Create a channel (owner becomes initial admin and subscriber)
+    socket.on('channel:create', async (data) => {
+        try {
+            const ownerPhone = socket.phone || data.ownerPhone;
+            const ownerId = data.ownerId || null;
+            let owner = null;
+            if (ownerId && mongoose.Types.ObjectId.isValid(ownerId)) owner = await User.findById(ownerId);
+            else if (ownerPhone) owner = await User.findOne({ phone: String(ownerPhone).trim() });
+            if (!owner) return socket.emit('channel:error', { message: 'Owner not found' });
+
+            // handle avatar upload (base64 or provided file url)
+            let avatarUrl = data.avatarUrl || null;
+            if (data.avatarBase64) {
+                try {
+                    const saved = await saveBase64Image(data.avatarBase64, owner.phone || owner._id, 'channel_avatar');
+                    if (saved) avatarUrl = saved;
+                } catch (err) {
+                    console.warn('channel:create avatar upload failed:', err && err.message ? err.message : err);
+                }
+            }
+
+            const inviteLink = data.inviteLink || (data.type === 'private' ? `sparkle.me/join/${Math.random().toString(36).slice(2,10)}` : null);
+
+            const channelDoc = await Channel.create({
+                name: String(data.name || '').trim(),
+                description: data.description || null,
+                avatar: avatarUrl,
+                username: data.username || null,
+                type: data.type === 'private' ? 'private' : 'public',
+                inviteLink,
+                owner: owner._id,
+                admins: [{ user: owner._id, permissions: { canPost: true, canEdit: true, canDelete: true, canAddAdmins: true } }],
+                subscribers: [owner._id],
+                bannedUsers: [],
+                restrictedContent: !!data.restrictedContent,
+            });
+
+            const channelObj = channelDoc.toObject ? channelDoc.toObject() : channelDoc;
+            socket.join(String(channelObj._id));
+            io.emit('channel:created', channelObj);
+            socket.emit('channel:create:success', channelObj);
+        } catch (err) {
+            console.error('socket channel:create error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to create channel' });
+        }
+    });
+
+    // Join channel
+    socket.on('channel:join', async (data) => {
+        try {
+            const channelId = data.channelId;
+            if (!mongoose.Types.ObjectId.isValid(channelId)) return socket.emit('channel:error', { message: 'Invalid channelId' });
+            const channel = await Channel.findById(channelId);
+            if (!channel) return socket.emit('channel:error', { message: 'Channel not found' });
+
+            const userPhone = socket.phone || data.userPhone;
+            const userId = data.userId || null;
+            let user = null;
+            if (userId && mongoose.Types.ObjectId.isValid(userId)) user = await User.findById(userId);
+            else if (userPhone) user = await User.findOne({ phone: String(userPhone).trim() });
+            if (!user) return socket.emit('channel:error', { message: 'User not found' });
+
+            if ((channel.bannedUsers || []).some(b => String(b) === String(user._id))) return socket.emit('channel:error', { message: 'You are banned from this channel' });
+
+            if (!(channel.subscribers || []).some(s => String(s) === String(user._id))) {
+                channel.subscribers.push(user._id);
+                await channel.save();
+            }
+
+            socket.join(String(channel._id));
+            io.to(String(channel._id)).emit('channel:member_joined', { channelId: channel._id, user: { _id: user._id, phone: user.phone, username: user.username } });
+            socket.emit('channel:join:success', { channelId: channel._id });
+        } catch (err) {
+            console.error('socket channel:join error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to join channel' });
+        }
+    });
+
+    // Leave channel
+    socket.on('channel:leave', async (data) => {
+        try {
+            const channelId = data.channelId;
+            if (!mongoose.Types.ObjectId.isValid(channelId)) return socket.emit('channel:error', { message: 'Invalid channelId' });
+            const channel = await Channel.findById(channelId);
+            if (!channel) return socket.emit('channel:error', { message: 'Channel not found' });
+
+            const userPhone = socket.phone || data.userPhone;
+            const userId = data.userId || null;
+            let user = null;
+            if (userId && mongoose.Types.ObjectId.isValid(userId)) user = await User.findById(userId);
+            else if (userPhone) user = await User.findOne({ phone: String(userPhone).trim() });
+            if (!user) return socket.emit('channel:error', { message: 'User not found' });
+
+            channel.subscribers = (channel.subscribers || []).filter(s => String(s) !== String(user._id));
+            channel.admins = (channel.admins || []).filter(a => String(a.user || a) !== String(user._id));
+            await channel.save();
+
+            try { socket.leave(String(channel._id)); } catch (e) {}
+            io.to(String(channel._id)).emit('channel:member_left', { channelId: channel._id, userId: user._id });
+            socket.emit('channel:leave:success', { channelId: channel._id });
+        } catch (err) {
+            console.error('socket channel:leave error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to leave channel' });
+        }
+    });
+
+    // Create channel post (owner/admins with canPost)
+    socket.on('channel:post:create', async (data) => {
+        try {
+            const channelId = data.channelId;
+            if (!mongoose.Types.ObjectId.isValid(channelId)) return socket.emit('channel:error', { message: 'Invalid channelId' });
+            const channel = await Channel.findById(channelId);
+            if (!channel) return socket.emit('channel:error', { message: 'Channel not found' });
+
+            // identify user
+            const userPhone = socket.phone || data.authorPhone;
+            const authorId = data.authorId || null;
+            let author = null;
+            if (authorId && mongoose.Types.ObjectId.isValid(authorId)) author = await User.findById(authorId);
+            else if (userPhone) author = await User.findOne({ phone: String(userPhone).trim() });
+            if (!author) return socket.emit('channel:error', { message: 'Author not found' });
+
+            // Permissions: owner or admin with canPost
+            const isOwner = String(channel.owner) === String(author._id);
+            const adminEntry = (channel.admins || []).find(a => String(a.user || a) === String(author._id));
+            const isAdminWithPost = adminEntry ? (adminEntry.permissions ? !!adminEntry.permissions.canPost : true) : false;
+            if (!isOwner && !isAdminWithPost) return socket.emit('channel:error', { message: 'No permission to post' });
+
+            const mediaObjects = [];
+            // support data.mediaBase64: array of base64 strings
+            if (Array.isArray(data.mediaBase64) && data.mediaBase64.length) {
+                for (const b64 of data.mediaBase64) {
+                    try {
+                        const raw = b64.split(',').pop();
+                        const buffer = Buffer.from(raw, 'base64');
+                        const fakeFile = { buffer };
+                        const uploadRes = await uploadBufferToCloudinary(fakeFile);
+                        mediaObjects.push({ url: uploadRes.secure_url || uploadRes.url, type: uploadRes.resource_type === 'video' ? 'video' : 'image', publicId: uploadRes.public_id });
+                    } catch (err) {
+                        console.warn('channel:post:create media upload failed:', err && err.message ? err.message : err);
+                        // skip failed media
+                    }
+                }
+            }
+
+            // support provided mediaUrls array of {url,publicId,type}
+            if (Array.isArray(data.media) && data.media.length) {
+                for (const m of data.media) {
+                    if (m && m.url) mediaObjects.push({ url: m.url, type: m.type || 'image', publicId: m.publicId || m.public_id || null });
+                }
+            }
+
+            const postDoc = await ChannelPost.create({
+                channelId: channel._id,
+                authorId: author._id,
+                text: data.text || '',
+                media: mediaObjects,
+                views: [],
+                reactions: [],
+                isPinned: !!data.isPinned,
+                isSilent: !!data.isSilent,
+                scheduledAt: data.scheduledAt ? new Date(data.scheduledAt) : null,
+            });
+
+            const postObj = postDoc.toObject();
+            io.to(String(channel._id)).emit('channel:post:new', postObj);
+            socket.emit('channel:post:create:success', postObj);
+        } catch (err) {
+            console.error('socket channel:post:create error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to create post' });
+        }
+    });
+
+    // Edit channel post (author or admin with canEdit)
+    socket.on('channel:post:edit', async (data) => {
+        try {
+            const { channelId, postId, text } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId)) return socket.emit('channel:error', { message: 'Invalid ids' });
+            const channel = await Channel.findById(channelId);
+            const post = await ChannelPost.findById(postId);
+            if (!channel || !post) return socket.emit('channel:error', { message: 'Channel or post not found' });
+
+            const userPhone = socket.phone || data.userPhone;
+            const userId = data.userId || null;
+            let user = null;
+            if (userId && mongoose.Types.ObjectId.isValid(userId)) user = await User.findById(userId);
+            else if (userPhone) user = await User.findOne({ phone: String(userPhone).trim() });
+            if (!user) return socket.emit('channel:error', { message: 'User not found' });
+
+            const isOwner = String(channel.owner) === String(user._id);
+            const adminEntry = (channel.admins || []).find(a => String(a.user || a) === String(user._id));
+            const canEdit = isOwner || (adminEntry && adminEntry.permissions && adminEntry.permissions.canEdit);
+            if (!canEdit && String(post.authorId) !== String(user._id)) return socket.emit('channel:error', { message: 'Not authorized to edit' });
+
+            if (typeof text === 'string') post.text = text;
+            // TODO: support media edits (add/remove) safely
+            await post.save();
+            io.to(String(channel._id)).emit('channel:post:updated', { postId: post._id, post: post.toObject() });
+            socket.emit('channel:post:edit:success', post.toObject());
+        } catch (err) {
+            console.error('socket channel:post:edit error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to edit post' });
+        }
+    });
+
+    // Delete channel post (owner or admin with canDelete)
+    socket.on('channel:post:delete', async (data) => {
+        try {
+            const { channelId, postId } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId)) return socket.emit('channel:error', { message: 'Invalid ids' });
+            const channel = await Channel.findById(channelId);
+            const post = await ChannelPost.findById(postId);
+            if (!channel || !post) return socket.emit('channel:error', { message: 'Channel or post not found' });
+
+            const userPhone = socket.phone || data.userPhone;
+            const userId = data.userId || null;
+            let user = null;
+            if (userId && mongoose.Types.ObjectId.isValid(userId)) user = await User.findById(userId);
+            else if (userPhone) user = await User.findOne({ phone: String(userPhone).trim() });
+            if (!user) return socket.emit('channel:error', { message: 'User not found' });
+
+            const isOwner = String(channel.owner) === String(user._id);
+            const adminEntry = (channel.admins || []).find(a => String(a.user || a) === String(user._id));
+            const canDelete = isOwner || (adminEntry && adminEntry.permissions && adminEntry.permissions.canDelete);
+            if (!canDelete && String(post.authorId) !== String(user._id)) return socket.emit('channel:error', { message: 'Not authorized to delete' });
+
+            // attempt to remove cloudinary assets
+            if (Array.isArray(post.media)) {
+                for (const m of post.media) {
+                    if (m && m.publicId) {
+                        try {
+                            await cloudinary.uploader.destroy(m.publicId, { resource_type: m.type === 'video' ? 'video' : 'image' });
+                        } catch (err) {
+                            console.warn('Failed to destroy cloudinary asset', m.publicId, err && err.message ? err.message : err);
+                        }
+                    }
+                }
+            }
+
+            await post.deleteOne();
+            io.to(String(channel._id)).emit('channel:post:deleted', { postId });
+            socket.emit('channel:post:delete:success', { postId });
+        } catch (err) {
+            console.error('socket channel:post:delete error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to delete post' });
+        }
+    });
+
+    // Pin/unpin post
+    socket.on('channel:post:pin', async (data) => {
+        try {
+            const { channelId, postId, byUserId } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId)) return socket.emit('channel:error', { message: 'Invalid ids' });
+            const channel = await Channel.findById(channelId);
+            if (!channel) return socket.emit('channel:error', { message: 'Channel not found' });
+
+            const byUser = byUserId && mongoose.Types.ObjectId.isValid(byUserId) ? await User.findById(byUserId) : null;
+            if (!byUser) return socket.emit('channel:error', { message: 'User not found' });
+            const isOwner = String(channel.owner) === String(byUser._id);
+            const adminEntry = (channel.admins || []).find(a => String(a.user || a) === String(byUser._id));
+            const canPin = isOwner || (adminEntry && adminEntry.permissions && (adminEntry.permissions.canEdit || adminEntry.permissions.canDelete));
+            if (!canPin) return socket.emit('channel:error', { message: 'Not authorized to pin' });
+
+            await ChannelPost.updateMany({ channelId: channel._id }, { $set: { isPinned: false } });
+            await ChannelPost.findByIdAndUpdate(postId, { isPinned: true });
+            io.to(String(channel._id)).emit('channel:post:pinned', { postId });
+            socket.emit('channel:post:pin:success', { postId });
+        } catch (err) {
+            console.error('socket channel:post:pin error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to pin post' });
+        }
+    });
+
+    // View post (unique per user)
+    socket.on('channel:post:view', async (data) => {
+        try {
+            const { channelId, postId, userId } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId)) return;
+            const post = await ChannelPost.findById(postId);
+            if (!post) return;
+            const uid = userId || (socket.userId || null);
+            if (!uid && socket.phone) {
+                const u = await User.findOne({ phone: socket.phone });
+                if (u) uid = u._id;
+            }
+            if (!uid) return;
+            if (!post.views.some(v => String(v) === String(uid))) {
+                post.views.push(uid);
+                await post.save();
+                io.to(String(channelId)).emit('channel:post:views_updated', { postId, viewsCount: post.views.length });
+            }
+        } catch (err) {
+            console.error('socket channel:post:view error:', err);
+        }
+    });
+
+    // Reaction toggle
+    socket.on('channel:post:react', async (data) => {
+        try {
+            const { channelId, postId, userId, emoji } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId)) return socket.emit('channel:error', { message: 'Invalid ids' });
+            if (!emoji) return socket.emit('channel:error', { message: 'emoji required' });
+            const post = await ChannelPost.findById(postId);
+            if (!post) return socket.emit('channel:error', { message: 'Post not found' });
+            const uid = userId || (socket.userId || null);
+            let userObjectId = uid;
+            if (!userObjectId && socket.phone) {
+                const u = await User.findOne({ phone: socket.phone });
+                if (u) userObjectId = u._id;
+            }
+            if (!userObjectId) return socket.emit('channel:error', { message: 'User required' });
+
+            let reaction = (post.reactions || []).find(r => r.emoji === emoji);
+            if (!reaction) {
+                reaction = { emoji, users: [] };
+                post.reactions.push(reaction);
+            }
+            const idx = reaction.users.findIndex(u => String(u) === String(userObjectId));
+            if (idx >= 0) reaction.users.splice(idx, 1);
+            else reaction.users.push(userObjectId);
+            await post.save();
+            io.to(String(channelId)).emit('channel:post:reactions_updated', { postId, reactions: post.reactions });
+            socket.emit('channel:post:react:success', { postId, reactions: post.reactions });
+        } catch (err) {
+            console.error('socket channel:post:react error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to react' });
+        }
+    });
+
+    // Add comment
+    socket.on('channel:comment:add', async (data) => {
+        try {
+            const { channelId, postId, text } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId) || !text) return socket.emit('channel:error', { message: 'Invalid payload' });
+            const post = await ChannelPost.findById(postId);
+            if (!post) return socket.emit('channel:error', { message: 'Post not found' });
+
+            let author = null;
+            if (data.authorId && mongoose.Types.ObjectId.isValid(data.authorId)) author = await User.findById(data.authorId);
+            else if (socket.phone) author = await User.findOne({ phone: socket.phone });
+            if (!author) return socket.emit('channel:error', { message: 'Author not found' });
+
+            const comment = await ChannelComment.create({ postId: post._id, channelId: channelId, authorId: author._id, text, mediaUrl: data.mediaUrl || null });
+            io.to(String(channelId)).emit('channel:comment:new', { postId, comment: comment.toObject() });
+            socket.emit('channel:comment:add:success', comment.toObject());
+        } catch (err) {
+            console.error('socket channel:comment:add error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to add comment' });
+        }
+    });
+
+    // Update admin permissions (only owner)
+    socket.on('channel:admin:update_permissions', async (data) => {
+        try {
+            const { channelId, targetUserId, permissions, byUserId } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(targetUserId) || !mongoose.Types.ObjectId.isValid(byUserId)) return socket.emit('channel:error', { message: 'Invalid ids' });
+            const channel = await Channel.findById(channelId);
+            if (!channel) return socket.emit('channel:error', { message: 'Channel not found' });
+            if (String(channel.owner) !== String(byUserId)) return socket.emit('channel:error', { message: 'Only owner can update admin permissions' });
+
+            const adminIdx = (channel.admins || []).findIndex(a => String(a.user || a) === String(targetUserId));
+            const entry = { user: targetUserId, permissions: Object.assign({ canPost: true, canEdit: false, canDelete: false, canAddAdmins: false }, permissions || {}) };
+            if (adminIdx >= 0) channel.admins[adminIdx] = entry;
+            else channel.admins.push(entry);
+            await channel.save();
+            io.to(String(channel._id)).emit('channel:admin:permissions_updated', { channelId: channel._id, admin: entry });
+            socket.emit('channel:admin:update_permissions:success', { admin: entry });
+        } catch (err) {
+            console.error('socket channel:admin:update_permissions error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to update admin permissions' });
+        }
+    });
+
+    // Ban user from channel (owner only)
+    socket.on('channel:user:ban', async (data) => {
+        try {
+            const { channelId, targetUserId, byUserId } = data;
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(targetUserId) || !mongoose.Types.ObjectId.isValid(byUserId)) return socket.emit('channel:error', { message: 'Invalid ids' });
+            const channel = await Channel.findById(channelId);
+            if (!channel) return socket.emit('channel:error', { message: 'Channel not found' });
+            if (String(channel.owner) !== String(byUserId)) return socket.emit('channel:error', { message: 'Only owner can ban users' });
+
+            if (!(channel.bannedUsers || []).some(b => String(b) === String(targetUserId))) channel.bannedUsers.push(targetUserId);
+            channel.subscribers = (channel.subscribers || []).filter(s => String(s) !== String(targetUserId));
+            channel.admins = (channel.admins || []).filter(a => String(a.user || a) !== String(targetUserId));
+            await channel.save();
+            io.to(String(channel._id)).emit('channel:user:banned', { channelId: channel._id, userId: targetUserId });
+            socket.emit('channel:user:ban:success', { userId: targetUserId });
+        } catch (err) {
+            console.error('socket channel:user:ban error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to ban user' });
         }
     });
 
