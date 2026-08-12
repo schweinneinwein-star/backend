@@ -871,7 +871,7 @@ app.post('/api/channels/:id/posts', uploadAnyMiddleware, async (req, res) => {
             }
         }
 
-        const post = await ChannelPost.create({ channelId: channel._id, authorId: author._id, content: content || '', media: mediaUrls });
+        const post = await ChannelPost.create({ channelId: channel._id, authorId: author._id, text: content || '', media: (mediaUrls || []).map(u => ({ url: u })) });
         const postObj = post.toObject();
         // notify subscribers in socket room
         try { io.to(String(channel._id)).emit('new_channel_post', postObj); } catch (e) { /* ignore */ }
@@ -921,16 +921,27 @@ app.post('/api/channels/:id/posts/:postId/pin', async (req, res) => {
 app.post('/api/channels/:id/posts/:postId/react', async (req, res) => {
     try {
         const { id, postId } = req.params;
-        const { userId, emoji } = req.body;
+        const { userId, userPhone, emoji } = req.body;
         if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(postId)) return res.status(400).json({ error: 'Invalid id' });
         const post = await ChannelPost.findOne({ _id: postId, channelId: id });
         if (!post) return res.status(404).json({ error: 'Post not found' });
-        if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ error: 'userId required' });
-        const existing = post.reactions.find(r => r.userId && String(r.userId) === String(userId) && r.emoji === emoji);
+
+        let resolvedUserId = null;
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) resolvedUserId = userId;
+        else if (userPhone) {
+            const u = await User.findOne({ phone: String(userPhone).trim() });
+            if (u) resolvedUserId = String(u._id);
+        }
+
+        if (!resolvedUserId) return res.status(400).json({ error: 'userId or userPhone required' });
+
+        const existing = (post.reactions || []).find(r => String(r.userId || r.user) === String(resolvedUserId) && r.emoji === emoji);
         if (existing) {
-            post.reactions = post.reactions.filter(r => !(String(r.userId) === String(userId) && r.emoji === emoji));
+            post.reactions = post.reactions.filter(r => !(String(r.userId || r.user) === String(resolvedUserId) && r.emoji === emoji));
         } else {
-            post.reactions.push({ userId, emoji });
+            // normalize shape: store as { userId, emoji }
+            post.reactions = post.reactions || [];
+            post.reactions.push({ userId: resolvedUserId, emoji });
         }
         await post.save();
         try { io.to(String(id)).emit('post_reactions_updated', { postId, reactions: post.reactions }); } catch (e) {}
@@ -1064,7 +1075,21 @@ app.get('/api/channels/:id', async (req, res) => {
         const channel = await Channel.findById(id).lean();
         if (!channel) return res.status(404).json({ error: 'Channel not found' });
 
-        const posts = await ChannelPost.find({ channelId: channel._id }).sort({ isPinned: -1, createdAt: -1 }).lean();
+        let posts = await ChannelPost.find({ channelId: channel._id }).sort({ isPinned: -1, createdAt: -1 }).lean();
+        // attach author display info for frontend convenience
+        try {
+            const authorIds = Array.from(new Set(posts.map(p => String(p.authorId)).filter(Boolean)));
+            const authors = await User.find({ _id: { $in: authorIds } }).lean();
+            const authorMap = {};
+            authors.forEach(a => { authorMap[String(a._id)] = a; });
+            posts = posts.map(p => ({
+                ...p,
+                authorName: (authorMap[String(p.authorId)] && ((authorMap[String(p.authorId)].firstName || authorMap[String(p.authorId)].username) ? `${authorMap[String(p.authorId)].firstName || ''} ${authorMap[String(p.authorId)].lastName || ''}`.trim() : authorMap[String(p.authorId)].username || authorMap[String(p.authorId)].phone) ) || null,
+                authorAvatar: authorMap[String(p.authorId)] ? (authorMap[String(p.authorId)].avatarUrl || authorMap[String(p.authorId)].avatar || null) : null,
+            }));
+        } catch (e) {
+            console.warn('Failed to attach author info to posts:', e && e.message ? e.message : e);
+        }
         const userPhone = req.query.userPhone ? String(req.query.userPhone).trim() : null;
         let isSubscriber = false;
         let isAdmin = false;
@@ -2289,6 +2314,7 @@ socket.on('update_profile', async (data) => {
             }
 
             const postDoc = await ChannelPost.create({
+                    text: data.content || '',
                 channelId: channel._id,
                 authorId: author._id,
                 text: data.text || '',
@@ -2711,7 +2737,7 @@ socket.on('update_profile', async (data) => {
             if (!isAdmin) return socket.emit('channel_error', 'Only owner or admins can create posts');
 
             const mediaUrls = Array.isArray(data.media) ? data.media : (data.media ? [data.media] : []);
-            const post = await ChannelPost.create({ channelId: channel._id, authorId: author._id, content: data.content || '', media: mediaUrls });
+            const post = await ChannelPost.create({ channelId: channel._id, authorId: author._id, text: data.content || '', media: (mediaUrls || []).map(u => ({ url: u })) });
             const p = post.toObject();
             io.to(String(channel._id)).emit('new_channel_post', p);
             socket.emit('create_channel_post_success', p);
