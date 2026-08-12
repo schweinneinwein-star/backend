@@ -972,15 +972,60 @@ app.post('/api/channels/:id/posts/:postId/view', async (req, res) => {
     }
 });
 
+app.get('/api/channels/:id/posts/:postId/comments', async (req, res) => {
+    try {
+        const { id, postId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(postId)) return res.status(400).json({ error: 'Invalid id' });
+        const post = await ChannelPost.findOne({ _id: postId, channelId: id }).lean();
+        if (!post) return res.status(404).json({ error: 'Post not found' });
+
+        const comments = await ChannelComment.find({ postId: post._id }).sort({ createdAt: 1 }).lean();
+        const authorIds = Array.from(new Set(comments.map(c => String(c.authorId)).filter(Boolean)));
+        const authors = await User.find({ _id: { $in: authorIds } }).lean();
+        const authorMap = {};
+        authors.forEach((author) => { authorMap[String(author._id)] = author; });
+
+        const normalizedComments = comments.map((comment) => {
+            const author = authorMap[String(comment.authorId)] || null;
+            return {
+                _id: comment._id,
+                id: comment._id,
+                postId: comment.postId,
+                channelId: comment.channelId,
+                authorId: comment.authorId,
+                authorPhone: author ? author.phone : null,
+                senderPhone: author ? author.phone : null,
+                senderName: author ? ([author.firstName, author.lastName].filter(Boolean).join(' ') || author.username || author.phone) : 'User',
+                senderAvatar: author ? (author.avatarUrl || null) : null,
+                text: comment.text,
+                mediaUrl: comment.mediaUrl || null,
+                timestamp: comment.createdAt || comment.created_at || Date.now(),
+                createdAt: comment.createdAt || comment.created_at || Date.now(),
+            };
+        });
+
+        return res.json({ post, comments: normalizedComments });
+    } catch (err) {
+        console.error('Fetch comments error:', err);
+        res.status(500).json({ error: 'Failed to fetch comments' });
+    }
+});
+
 app.post('/api/channels/:id/posts/:postId/comments', async (req, res) => {
     try {
         const { id, postId } = req.params;
-        const { authorId, text } = req.body;
+        const { authorId, authorPhone, text } = req.body;
         if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(postId)) return res.status(400).json({ error: 'Invalid id' });
-        if (!authorId || !mongoose.Types.ObjectId.isValid(authorId) || !text) return res.status(400).json({ error: 'authorId and text required' });
+        if (!text || !String(text).trim()) return res.status(400).json({ error: 'Text required' });
+
+        let author = null;
+        if (authorId && mongoose.Types.ObjectId.isValid(authorId)) author = await User.findById(authorId);
+        else if (authorPhone) author = await User.findOne({ phone: String(authorPhone).trim() });
+        if (!author) return res.status(400).json({ error: 'Author not found' });
+
         const post = await ChannelPost.findOne({ _id: postId, channelId: id });
         if (!post) return res.status(404).json({ error: 'Post not found' });
-        const comment = await ChannelComment.create({ postId: post._id, authorId, text });
+        const comment = await ChannelComment.create({ postId: post._id, channelId: id, authorId: author._id, text: String(text).trim() });
         try { io.to(String(id)).emit('channel_comment_added', { postId, comment: comment.toObject() }); } catch (e) {}
         return res.status(201).json(comment);
     } catch (err) {
@@ -2498,20 +2543,39 @@ socket.on('update_profile', async (data) => {
         }
     });
 
+    socket.on('channel:comment:get', async (data) => {
+        try {
+            const { channelId, postId } = data || {};
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId)) {
+                return socket.emit('channel:error', { message: 'Invalid payload' });
+            }
+
+            const post = await ChannelPost.findById(postId);
+            if (!post) return socket.emit('channel:error', { message: 'Post not found' });
+
+            const comments = await ChannelComment.find({ postId: post._id }).sort({ createdAt: 1 }).lean();
+            socket.emit('channel:comment:get:success', { channelId, postId, comments });
+        } catch (err) {
+            console.error('socket channel:comment:get error:', err);
+            socket.emit('channel:error', { message: err.message || 'Failed to fetch comments' });
+        }
+    });
+
     // Add comment
     socket.on('channel:comment:add', async (data) => {
         try {
             const { channelId, postId, text } = data;
-            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId) || !text) return socket.emit('channel:error', { message: 'Invalid payload' });
+            if (!mongoose.Types.ObjectId.isValid(channelId) || !mongoose.Types.ObjectId.isValid(postId) || !text || !String(text).trim()) return socket.emit('channel:error', { message: 'Invalid payload' });
             const post = await ChannelPost.findById(postId);
             if (!post) return socket.emit('channel:error', { message: 'Post not found' });
 
             let author = null;
             if (data.authorId && mongoose.Types.ObjectId.isValid(data.authorId)) author = await User.findById(data.authorId);
+            else if (data.authorPhone) author = await User.findOne({ phone: String(data.authorPhone).trim() });
             else if (socket.phone) author = await User.findOne({ phone: socket.phone });
             if (!author) return socket.emit('channel:error', { message: 'Author not found' });
 
-            const comment = await ChannelComment.create({ postId: post._id, channelId: channelId, authorId: author._id, text, mediaUrl: data.mediaUrl || null });
+            const comment = await ChannelComment.create({ postId: post._id, channelId: channelId, authorId: author._id, text: String(text).trim(), mediaUrl: data.mediaUrl || null });
             io.to(String(channelId)).emit('channel:comment:new', { postId, comment: comment.toObject() });
             socket.emit('channel:comment:add:success', comment.toObject());
         } catch (err) {
