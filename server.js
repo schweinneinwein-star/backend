@@ -1040,15 +1040,22 @@ app.get('/api/channels/search', async (req, res) => {
         const safeQuery = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const regex = new RegExp(safeQuery, 'i');
 
-        const results = await Channel.find({
+        let results = await Channel.find({
             type: 'public',
             $or: [
                 { $text: { $search: q } },
                 { username: regex },
                 { name: regex },
                 { description: regex },
+                { 'bio': regex },
             ],
         }).limit(50).lean();
+
+        // ensure name and description are matched by text index fallback if $text was not present
+        if (!results || results.length === 0) {
+            // try wider search using regex across name and description
+            results = await Channel.find({ type: 'public', $or: [ { name: regex }, { description: regex }, { username: regex }, { bio: regex } ] }).limit(50).lean();
+        }
 
         const formatted = results.map((channel) => ({
             _id: channel._id,
