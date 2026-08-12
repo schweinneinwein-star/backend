@@ -392,6 +392,58 @@ const Channel = mongoose.models.Channel || mongoose.model('Channel', channelSche
 const ChannelPost = mongoose.models.ChannelPost || mongoose.model('ChannelPost', channelPostSchema);
 const ChannelComment = mongoose.models.ChannelComment || mongoose.model('ChannelComment', channelCommentSchema);
 
+function normalizeReactionGroups(reactions) {
+    const groups = {};
+    const queue = Array.isArray(reactions) ? reactions : [];
+
+    queue.forEach((entry) => {
+        if (!entry || typeof entry !== 'object') return;
+        const emoji = entry.emoji || entry.reaction;
+        if (!emoji) return;
+        const users = Array.isArray(entry.users)
+            ? entry.users
+            : ((entry.userId || entry.user) ? [entry.userId || entry.user] : []);
+        const uniqueUsers = Array.from(new Set((users || []).map((u) => String(u)).filter(Boolean)));
+        const current = groups[emoji] || [];
+        groups[emoji] = Array.from(new Set([...current, ...uniqueUsers]));
+    });
+
+    return groups;
+}
+
+function upsertReactionForUser(post, userId, emoji) {
+    const safeUserId = String(userId);
+    const safeEmoji = String(emoji || '').trim();
+    if (!safeUserId || !safeEmoji) return post;
+
+    const nextReactions = (post.reactions || []).map((entry) => ({
+        emoji: entry.emoji,
+        users: Array.isArray(entry.users) ? entry.users.map((u) => String(u)) : []
+    }));
+
+    const existingEntry = nextReactions.find((entry) => entry.emoji === safeEmoji);
+    if (existingEntry) {
+        const nextUsers = existingEntry.users.filter((id) => String(id) !== safeUserId);
+        if (nextUsers.length === 0) {
+            post.reactions = nextReactions.filter((entry) => entry.emoji !== safeEmoji);
+            return post;
+        }
+        existingEntry.users = nextUsers;
+        post.reactions = nextReactions.map((entry) => ({
+            emoji: entry.emoji,
+            users: Array.from(new Set(entry.users.map((id) => String(id))))
+        }));
+        return post;
+    }
+
+    nextReactions.push({ emoji: safeEmoji, users: [safeUserId] });
+    post.reactions = nextReactions.map((entry) => ({
+        emoji: entry.emoji,
+        users: Array.from(new Set(entry.users.map((id) => String(id))))
+    }));
+    return post;
+}
+
 // ------------------------------------------------------------
 
 async function initCaches() {
@@ -935,13 +987,23 @@ app.post('/api/channels/:id/posts/:postId/react', async (req, res) => {
 
         if (!resolvedUserId) return res.status(400).json({ error: 'userId or userPhone required' });
 
-        const existing = (post.reactions || []).find(r => String(r.userId || r.user) === String(resolvedUserId) && r.emoji === emoji);
-        if (existing) {
-            post.reactions = post.reactions.filter(r => !(String(r.userId || r.user) === String(resolvedUserId) && r.emoji === emoji));
+        post.reactions = post.reactions || [];
+        const normalized = normalizeReactionGroups(post.reactions);
+        const currentUsers = normalized[emoji] || [];
+        if (currentUsers.includes(String(resolvedUserId))) {
+            const nextReactions = (post.reactions || []).map((entry) => ({
+                emoji: entry.emoji,
+                users: Array.isArray(entry.users) ? entry.users.filter((u) => String(u) !== String(resolvedUserId)) : []
+            })).filter((entry) => entry.emoji && entry.users.length > 0);
+            post.reactions = nextReactions;
         } else {
-            // normalize shape: store as { userId, emoji }
-            post.reactions = post.reactions || [];
-            post.reactions.push({ userId: resolvedUserId, emoji });
+            const reactionEntry = (post.reactions || []).find((entry) => entry.emoji === emoji);
+            if (reactionEntry) {
+                const nextUsers = Array.isArray(reactionEntry.users) ? reactionEntry.users.map((u) => String(u)) : [];
+                reactionEntry.users = Array.from(new Set([...nextUsers, String(resolvedUserId)]));
+            } else {
+                post.reactions.push({ emoji, users: [resolvedUserId] });
+            }
         }
         await post.save();
         try { io.to(String(id)).emit('post_reactions_updated', { postId, reactions: post.reactions }); } catch (e) {}
@@ -2869,9 +2931,22 @@ socket.on('update_profile', async (data) => {
             if (!post) return socket.emit('channel_error', 'Post not found');
             const user = await User.findOne({ phone: socket.phone });
             if (!user) return socket.emit('channel_error', 'Not authenticated');
-            const existing = post.reactions.find(r => String(r.userId) === String(user._id) && r.emoji === emoji);
-            if (existing) post.reactions = post.reactions.filter(r => !(String(r.userId) === String(user._id) && r.emoji === emoji));
-            else post.reactions.push({ userId: user._id, emoji });
+
+            const normalized = (post.reactions || []).map((entry) => ({
+                emoji: entry.emoji,
+                users: Array.isArray(entry.users) ? entry.users.map((u) => String(u)) : []
+            }));
+            const reactionEntry = normalized.find((entry) => entry.emoji === emoji);
+            if (reactionEntry) {
+                reactionEntry.users = reactionEntry.users.filter((id) => String(id) !== String(user._id));
+                if (reactionEntry.users.length === 0) {
+                    post.reactions = normalized.filter((entry) => entry.emoji !== emoji);
+                } else {
+                    post.reactions = normalized;
+                }
+            } else {
+                post.reactions = [...normalized, { emoji, users: [user._id] }];
+            }
             await post.save();
             io.to(String(channelId)).emit('post_reactions_updated', { postId, reactions: post.reactions });
             socket.emit('add_reaction_success', { postId, reactions: post.reactions });
