@@ -1187,8 +1187,18 @@ app.get('/api/channels', async (req, res) => {
         const ownerPhone = req.query.ownerPhone;
         const ownerId = req.query.ownerId;
 
+        const findUserByPhone = async (rawPhone) => {
+            if (!rawPhone) return null;
+            const variants = Array.from(new Set([
+                String(rawPhone).trim(),
+                normalizePhoneString(rawPhone),
+            ].filter(Boolean)));
+            if (!variants.length) return null;
+            return User.findOne({ phone: { $in: variants } }).lean();
+        };
+
         if (ownerPhone) {
-            const owner = await User.findOne({ phone: String(ownerPhone).trim() });
+            const owner = await findUserByPhone(ownerPhone);
             if (!owner) return res.json({ channels: [] });
             const channels = await Channel.find({ owner: owner._id }).sort({ createdAt: -1 }).lean();
             return res.json({ channels });
@@ -1204,7 +1214,7 @@ app.get('/api/channels', async (req, res) => {
             return res.status(400).json({ error: 'subscribedPhone or ownerPhone query parameter is required' });
         }
 
-        const user = await User.findOne({ phone: String(subscribedPhone).trim() });
+        const user = await findUserByPhone(subscribedPhone);
         if (!user) {
             return res.json({ channels: [] });
         }
