@@ -385,6 +385,7 @@ const channelCommentSchema = new mongoose.Schema({
     authorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     text: { type: String, required: true },
     mediaUrl: { type: String, default: null },
+    reactions: [{ emoji: String, users: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }] }],
     createdAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -990,19 +991,25 @@ app.post('/api/channels/:id/posts/:postId/react', async (req, res) => {
         post.reactions = post.reactions || [];
         const normalized = normalizeReactionGroups(post.reactions);
         const currentUsers = normalized[emoji] || [];
+
+        // One reaction per user only: remove any previous emoji from this user before applying the new one.
+        const clearedReactions = (post.reactions || []).map((entry) => ({
+            emoji: entry.emoji,
+            users: Array.isArray(entry.users) ? entry.users.filter((u) => String(u) !== String(resolvedUserId)) : []
+        })).filter((entry) => entry.emoji && entry.users.length > 0);
+
         if (currentUsers.includes(String(resolvedUserId))) {
-            const nextReactions = (post.reactions || []).map((entry) => ({
-                emoji: entry.emoji,
-                users: Array.isArray(entry.users) ? entry.users.filter((u) => String(u) !== String(resolvedUserId)) : []
-            })).filter((entry) => entry.emoji && entry.users.length > 0);
-            post.reactions = nextReactions;
+            post.reactions = clearedReactions;
+            if (clearedReactions.some((entry) => entry.emoji === emoji)) {
+                post.reactions = clearedReactions.filter((entry) => entry.emoji !== emoji);
+            }
         } else {
-            const reactionEntry = (post.reactions || []).find((entry) => entry.emoji === emoji);
-            if (reactionEntry) {
-                const nextUsers = Array.isArray(reactionEntry.users) ? reactionEntry.users.map((u) => String(u)) : [];
-                reactionEntry.users = Array.from(new Set([...nextUsers, String(resolvedUserId)]));
+            const nextEntry = clearedReactions.find((entry) => entry.emoji === emoji);
+            if (nextEntry) {
+                nextEntry.users = Array.from(new Set([...nextEntry.users, String(resolvedUserId)]));
+                post.reactions = clearedReactions;
             } else {
-                post.reactions.push({ emoji, users: [resolvedUserId] });
+                post.reactions = [...clearedReactions, { emoji, users: [resolvedUserId] }];
             }
         }
         await post.save();
@@ -1063,6 +1070,7 @@ app.get('/api/channels/:id/posts/:postId/comments', async (req, res) => {
                 mediaUrl: comment.mediaUrl || null,
                 timestamp: comment.createdAt || comment.created_at || Date.now(),
                 createdAt: comment.createdAt || comment.created_at || Date.now(),
+                reactions: Array.isArray(comment.reactions) ? comment.reactions : [],
             };
         });
 
@@ -1087,12 +1095,64 @@ app.post('/api/channels/:id/posts/:postId/comments', async (req, res) => {
 
         const post = await ChannelPost.findOne({ _id: postId, channelId: id });
         if (!post) return res.status(404).json({ error: 'Post not found' });
-        const comment = await ChannelComment.create({ postId: post._id, channelId: id, authorId: author._id, text: String(text).trim() });
+        const comment = await ChannelComment.create({ postId: post._id, channelId: id, authorId: author._id, text: String(text).trim(), reactions: [] });
         try { io.to(String(id)).emit('channel_comment_added', { postId, comment: comment.toObject() }); } catch (e) {}
         return res.status(201).json(comment);
     } catch (err) {
         console.error('Add comment error:', err);
         res.status(500).json({ error: 'Failed to add comment' });
+    }
+});
+
+app.post('/api/channels/:id/posts/:postId/comments/:commentId/react', async (req, res) => {
+    try {
+        const { id, postId, commentId } = req.params;
+        const { userId, userPhone, emoji } = req.body;
+        if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(postId) || !mongoose.Types.ObjectId.isValid(commentId)) {
+            return res.status(400).json({ error: 'Invalid id' });
+        }
+
+        const comment = await ChannelComment.findOne({ _id: commentId, postId, channelId: id });
+        if (!comment) return res.status(404).json({ error: 'Comment not found' });
+
+        let resolvedUserId = null;
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) resolvedUserId = userId;
+        else if (userPhone) {
+            const user = await User.findOne({ phone: String(userPhone).trim() });
+            if (user) resolvedUserId = String(user._id);
+        }
+        if (!resolvedUserId) return res.status(400).json({ error: 'userId or userPhone required' });
+
+        const safeEmoji = String(emoji || '').trim();
+        if (!safeEmoji) return res.status(400).json({ error: 'emoji required' });
+
+        comment.reactions = Array.isArray(comment.reactions) ? comment.reactions : [];
+        const existing = comment.reactions.find((entry) => entry.emoji === safeEmoji);
+        const withoutUser = comment.reactions
+            .map((entry) => ({
+                emoji: entry.emoji,
+                users: Array.isArray(entry.users) ? entry.users.filter((u) => String(u) !== String(resolvedUserId)) : []
+            }))
+            .filter((entry) => entry.emoji && entry.users.length > 0);
+
+        if (existing && (existing.users || []).map(String).includes(String(resolvedUserId))) {
+            comment.reactions = withoutUser;
+        } else {
+            const nextEntry = withoutUser.find((entry) => entry.emoji === safeEmoji);
+            if (nextEntry) {
+                nextEntry.users = Array.from(new Set([...nextEntry.users, String(resolvedUserId)]));
+                comment.reactions = withoutUser;
+            } else {
+                comment.reactions = [...withoutUser, { emoji: safeEmoji, users: [resolvedUserId] }];
+            }
+        }
+
+        await comment.save();
+        try { io.to(String(id)).emit('channel:comment:reaction_updated', { postId, commentId, reactions: comment.reactions }); } catch (e) {}
+        return res.json({ success: true, reactions: comment.reactions });
+    } catch (err) {
+        console.error('Comment reaction error:', err);
+        return res.status(500).json({ error: 'Failed to react to comment' });
     }
 });
 
