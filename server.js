@@ -1190,14 +1190,21 @@ app.get('/api/channels/:id', async (req, res) => {
         if (!channel) return res.status(404).json({ error: 'Channel not found' });
 
         let posts = await ChannelPost.find({ channelId: channel._id }).sort({ isPinned: -1, createdAt: -1 }).lean();
-        // attach author display info for frontend convenience
         try {
+            const postIds = posts.map((p) => p._id).filter(Boolean);
+            const commentCounts = await ChannelComment.aggregate([
+                { $match: { postId: { $in: postIds } } },
+                { $group: { _id: '$postId', count: { $sum: 1 } } }
+            ]);
+            const commentMap = Object.fromEntries(commentCounts.map((entry) => [String(entry._id), Number(entry.count) || 0]));
+
             const authorIds = Array.from(new Set(posts.map(p => String(p.authorId)).filter(Boolean)));
             const authors = await User.find({ _id: { $in: authorIds } }).lean();
             const authorMap = {};
             authors.forEach(a => { authorMap[String(a._id)] = a; });
             posts = posts.map(p => ({
                 ...p,
+                commentCount: Number(commentMap[String(p._id)] || 0),
                 authorName: (authorMap[String(p.authorId)] && ((authorMap[String(p.authorId)].firstName || authorMap[String(p.authorId)].username) ? `${authorMap[String(p.authorId)].firstName || ''} ${authorMap[String(p.authorId)].lastName || ''}`.trim() : authorMap[String(p.authorId)].username || authorMap[String(p.authorId)].phone) ) || null,
                 authorAvatar: authorMap[String(p.authorId)] ? (authorMap[String(p.authorId)].avatarUrl || authorMap[String(p.authorId)].avatar || null) : null,
             }));
