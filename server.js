@@ -2153,28 +2153,83 @@ socket.on('update_profile', async (data) => {
         }
     });
 
-    socket.on('search_user', (data) => {
-        if (!data || !data.query) return socket.emit('search_results', { results: [] });
-        const q = data.query.toLowerCase();
-        
-        let users = loadUsers(); // Читаем свежие данные с диска
-        let rawResults = [];
-        if (data.mode === 'username') {
-            rawResults = users.filter(u => u.username?.toLowerCase().includes(q) || u.phone?.includes(q));
-        } else {
-            rawResults = users.filter(u => u.bio?.toLowerCase().includes(q));
+    socket.on('search_user', async (data) => {
+        try {
+            if (!data || !data.query) return socket.emit('search_results', { results: [] });
+            const query = String(data.query).trim();
+            if (!query) return socket.emit('search_results', { results: [] });
+
+            const normalizedQuery = query.replace(/^@+/, '').toLowerCase();
+            const q = normalizedQuery;
+
+            let users = loadUsers();
+            let userResults = [];
+            if (data.mode === 'username') {
+                userResults = users.filter((u) => {
+                    const username = String(u.username || '').toLowerCase();
+                    const phone = String(u.phone || '').toLowerCase();
+                    return username.includes(q) || phone.includes(q);
+                });
+            } else {
+                userResults = users.filter((u) => String(u.bio || '').toLowerCase().includes(q));
+            }
+
+            const userResultsNormalized = userResults.map((u) => ({
+                ...u,
+                type: 'user',
+                isOnline: !!onlineUsers[u.phone],
+                lastSeen: u.lastSeen || null,
+                joinDate: u.joinDate || null,
+                totalReadTime: u.totalReadTime || 0,
+                readMessageCount: u.readMessageCount || 0,
+                hideAnswerTime: u.hideAnswerTime || false,
+            }));
+
+            let channelResults = [];
+            if (mongoReady && mongoose.connection.readyState === 1) {
+                const safeQuery = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = new RegExp(safeQuery, 'i');
+                const channelMatches = await Channel.find({
+                    type: 'public',
+                    $or: [
+                        { username: regex },
+                        { name: regex },
+                        { description: regex },
+                        { bio: regex },
+                    ],
+                }).limit(50).lean();
+
+                channelResults = channelMatches.map((channel) => ({
+                    _id: String(channel._id),
+                    id: String(channel._id),
+                    type: 'channel',
+                    name: channel.name || channel.username || 'Канал',
+                    description: channel.description || channel.bio || '',
+                    username: channel.username || null,
+                    avatar: channel.avatar || null,
+                    avatarUrl: channel.avatar || null,
+                    banner: channel.banner || null,
+                    bannerUrl: channel.banner || null,
+                    subscriberCount: Array.isArray(channel.subscribers) ? channel.subscribers.length : 0,
+                    isOnline: false,
+                }));
+            }
+
+            const deduped = [...channelResults, ...userResultsNormalized].filter((item, index, arr) => {
+                return arr.findIndex((candidate) => {
+                    if (candidate.type !== item.type) return false;
+                    if (item.type === 'channel') {
+                        return String(candidate._id || candidate.id) === String(item._id || item.id);
+                    }
+                    return String(candidate.phone || candidate.username) === String(item.phone || item.username);
+                }) === index;
+            });
+
+            socket.emit('search_results', { results: deduped });
+        } catch (error) {
+            console.error('search_user error:', error);
+            socket.emit('search_results', { results: [] });
         }
-        
-        const results = rawResults.map(u => ({
-            ...u,
-            isOnline: !!onlineUsers[u.phone],
-            lastSeen: u.lastSeen || null,
-            joinDate: u.joinDate || null,
-            totalReadTime: u.totalReadTime || 0,
-            readMessageCount: u.readMessageCount || 0,
-            hideAnswerTime: u.hideAnswerTime || false,
-        }));
-        socket.emit('search_results', { results: results });
     });
 
     // ==================== ГОЛОСА (VOTES) ====================
