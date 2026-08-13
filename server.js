@@ -1492,6 +1492,8 @@ function broadcastChatList(userPhone) {
             bio: partnerUser.bio || "",
             avatarUrl: partnerUser.avatarUrl || "",
             bannerUrl: partnerUser.bannerUrl || "",
+            profileChannelId: partnerUser.profileChannelId || null,
+            profileChannelHidden: !!partnerUser.profileChannelHidden,
             lastMessage: previewText,
             timestamp: lastMsg.timestamp,
             unreadCount: unreadCount,
@@ -2199,6 +2201,24 @@ socket.on('update_profile', async (data) => {
             const q = normalizedQuery;
 
             let users = loadUsers();
+            if (mongoReady && mongoose.connection.readyState === 1) {
+                const mongoMatches = await User.find({
+                    $or: [
+                        { username: { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                        { bio: { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                        { phone: { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                    ],
+                }).lean();
+                if (mongoMatches.length) {
+                    const mergedMap = new Map();
+                    [...users, ...mongoMatches].forEach((u) => {
+                        if (!u || !u.phone) return;
+                        mergedMap.set(String(u.phone), { ...u });
+                    });
+                    users = Array.from(mergedMap.values());
+                }
+            }
+
             let userResults = [];
             if (data.mode === 'username') {
                 userResults = users.filter((u) => {
@@ -2213,6 +2233,8 @@ socket.on('update_profile', async (data) => {
             const userResultsNormalized = userResults.map((u) => ({
                 ...u,
                 type: 'user',
+                profileChannelId: u.profileChannelId || null,
+                profileChannelHidden: !!u.profileChannelHidden,
                 isOnline: !!onlineUsers[u.phone],
                 lastSeen: u.lastSeen || null,
                 joinDate: u.joinDate || null,
