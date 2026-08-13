@@ -317,6 +317,8 @@ const userSchema = new mongoose.Schema({
     totalReadTime: { type: Number, default: 0 },
     readMessageCount: { type: Number, default: 0 },
     hideAnswerTime: { type: Boolean, default: false },
+    profileChannelId: { type: mongoose.Schema.Types.ObjectId, ref: 'Channel', default: null },
+    profileChannelHidden: { type: Boolean, default: false },
     votes: { type: Number, default: 0 },
     blockedUsers: { type: [String], default: [] },
     blockedBy: { type: [String], default: [] },
@@ -1182,8 +1184,24 @@ app.post('/api/channels/:id/ban', async (req, res) => {
 app.get('/api/channels', async (req, res) => {
     try {
         const subscribedPhone = req.query.subscribedPhone;
+        const ownerPhone = req.query.ownerPhone;
+        const ownerId = req.query.ownerId;
+
+        if (ownerPhone) {
+            const owner = await User.findOne({ phone: String(ownerPhone).trim() });
+            if (!owner) return res.json({ channels: [] });
+            const channels = await Channel.find({ owner: owner._id }).sort({ createdAt: -1 }).lean();
+            return res.json({ channels });
+        }
+
+        if (ownerId) {
+            if (!mongoose.Types.ObjectId.isValid(ownerId)) return res.status(400).json({ error: 'Invalid ownerId' });
+            const channels = await Channel.find({ owner: ownerId }).sort({ createdAt: -1 }).lean();
+            return res.json({ channels });
+        }
+
         if (!subscribedPhone) {
-            return res.status(400).json({ error: 'subscribedPhone query parameter is required' });
+            return res.status(400).json({ error: 'subscribedPhone or ownerPhone query parameter is required' });
         }
 
         const user = await User.findOne({ phone: String(subscribedPhone).trim() });
@@ -1194,8 +1212,8 @@ app.get('/api/channels', async (req, res) => {
         const channels = await Channel.find({ subscribers: user._id }).sort({ createdAt: -1 }).lean();
         return res.json({ channels });
     } catch (err) {
-        console.error('Failed to list subscribed channels:', err);
-        res.status(500).json({ error: 'Failed to list subscribed channels' });
+        console.error('Failed to list channels:', err);
+        res.status(500).json({ error: 'Failed to list channels' });
     }
 });
 
@@ -1930,6 +1948,14 @@ socket.on('update_profile', async (data) => {
         if (data.firstName !== undefined) user.firstName = data.firstName;
         if (data.lastName !== undefined) user.lastName = data.lastName;
         if (data.hideAnswerTime !== undefined) user.hideAnswerTime = data.hideAnswerTime;
+        if (data.profileChannelHidden !== undefined) user.profileChannelHidden = !!data.profileChannelHidden;
+        if (data.profileChannelId !== undefined) {
+            if (!data.profileChannelId || String(data.profileChannelId) === 'null') {
+                user.profileChannelId = null;
+            } else if (mongoose.Types.ObjectId.isValid(data.profileChannelId)) {
+                user.profileChannelId = data.profileChannelId;
+            }
+        }
         if (data.password) user.password = data.password; // Сохраняем пароль
 
         // Сохраняем в MongoDB
