@@ -270,7 +270,7 @@ app.get('/debug/mongo', async (req, res) => {
 
 // Define Mongoose schemas and models
 const messageSchema = new mongoose.Schema({
-    text: { type: String, required: true },
+    text: { type: String, default: '' },
     sender: { type: String, default: null },
     recipient: { type: String, default: null },
     roomId: { type: String, default: null },
@@ -282,7 +282,15 @@ const messageSchema = new mongoose.Schema({
     stickerName: { type: String, default: null },
     packName: { type: String, default: null },
     timestamp: { type: Date, default: Date.now },
-    read: { type: Boolean, default: false }
+    read: { type: Boolean, default: false },
+    replyTo: { type: mongoose.Schema.Types.Mixed, default: null },
+    replyMeta: { type: mongoose.Schema.Types.Mixed, default: null },
+    deletedFor: { type: [String], default: [] },
+    isPinned: { type: Boolean, default: false },
+    pinnedBy: { type: String, default: null },
+    pinnedAt: { type: Date, default: null },
+    edited: { type: Boolean, default: false },
+    editedAt: { type: Date, default: null }
 }, { timestamps: true });
 
 const uploadFileSchema = new mongoose.Schema({
@@ -2112,6 +2120,9 @@ socket.on('update_profile', async (data) => {
             isVideo: !!data.isVideo,
             timestamp: data.timestamp ? new Date(data.timestamp) : new Date(),
             read: false,
+            replyTo: data.replyTo || null,
+            replyMeta: data.replyMeta || null,
+            deletedFor: [],
         };
 
         try {
@@ -2141,6 +2152,139 @@ socket.on('update_profile', async (data) => {
             } catch (emitErr) {
                 console.error('❌ Ошибка отправки fallback send_private_message:', emitErr);
             }
+        }
+    });
+
+    socket.on('message:reply', async (data) => {
+        try {
+            const senderPhone = socket.phone || data?.sender || data?.userId;
+            const recipientPhone = data?.recipientPhone || data?.chatId || data?.to || data?.recipient;
+            if (!senderPhone || !recipientPhone) return;
+
+            const payload = {
+                text: String(data?.text || '').trim(),
+                sender: senderPhone,
+                recipient: recipientPhone,
+                roomId: recipientPhone,
+                type: data?.type || 'text',
+                mediaUrls: Array.isArray(data?.mediaUrls) ? data.mediaUrls.map(String) : [],
+                timestamp: data?.timestamp ? new Date(data.timestamp) : new Date(),
+                read: false,
+                replyTo: data?.replyTo || null,
+                replyMeta: data?.replyMeta || null,
+                deletedFor: [],
+            };
+            const saved = await Message.create(payload);
+            const recipientSocketId = onlineUsers[recipientPhone];
+            if (recipientSocketId) io.to(recipientSocketId).emit('new_private_message', saved);
+            socket.emit('new_private_message', saved);
+            broadcastChatList(senderPhone);
+            broadcastChatList(recipientPhone);
+        } catch (err) {
+            console.error('message:reply error', err);
+        }
+    });
+
+    socket.on('message:edit', async (data) => {
+        try {
+            const { messageId, text, chatId, userId } = data || {};
+            if (!messageId || !text) return;
+            const updated = await Message.findOneAndUpdate(
+                { _id: messageId },
+                { $set: { text: String(text), edited: true, editedAt: Date.now() } },
+                { new: true }
+            );
+            if (!updated) return;
+            const payload = { chatId, messageId: String(updated._id), text: String(text), edited: true, editedAt: Date.now(), userId };
+            if (onlineUsers[userId]) io.to(onlineUsers[userId]).emit('message_edited', payload);
+            const peer = chatId && onlineUsers[chatId];
+            if (peer) io.to(peer).emit('message_edited', payload);
+        } catch (err) {
+            console.error('message:edit error', err);
+        }
+    });
+
+    socket.on('message:delete_for_all', async (data) => {
+        try {
+            const { messageId, chatId, userId } = data || {};
+            if (!messageId) return;
+            const removed = await Message.findOneAndDelete({ _id: messageId });
+            if (!removed) return;
+            const payload = { chatId, messageId: String(messageId), userId };
+            if (userId && onlineUsers[userId]) io.to(onlineUsers[userId]).emit('message_deleted_for_all', payload);
+            if (chatId && onlineUsers[chatId]) io.to(onlineUsers[chatId]).emit('message_deleted_for_all', payload);
+        } catch (err) {
+            console.error('message:delete_for_all error', err);
+        }
+    });
+
+    socket.on('message:delete_for_me', async (data) => {
+        try {
+            const { messageId, chatId, userId } = data || {};
+            if (!messageId || !userId) return;
+            const msg = await Message.findOne({ _id: messageId });
+            if (!msg) return;
+            const deletedFor = Array.isArray(msg.deletedFor) ? [...new Set([...msg.deletedFor, userId])] : [userId];
+            msg.deletedFor = deletedFor;
+            await msg.save();
+            const payload = { chatId, messageId: String(messageId), userId };
+            if (chatId && onlineUsers[chatId]) io.to(onlineUsers[chatId]).emit('message_deleted_for_me', payload);
+            if (onlineUsers[userId]) io.to(onlineUsers[userId]).emit('message_deleted_for_me', payload);
+        } catch (err) {
+            console.error('message:delete_for_me error', err);
+        }
+    });
+
+    socket.on('message:pin', async (data) => {
+        try {
+            const { messageId, chatId, userId } = data || {};
+            if (!messageId) return;
+            if (messageId && String(messageId).length > 0) {
+                await Message.updateOne({ _id: messageId }, { $set: { isPinned: true, pinnedBy: userId, pinnedAt: Date.now() } }, { upsert: false });
+            }
+            const payload = { chatId, messageId: String(messageId), userId };
+            if (chatId && onlineUsers[chatId]) io.to(onlineUsers[chatId]).emit('message_pinned', payload);
+            if (userId && onlineUsers[userId]) io.to(onlineUsers[userId]).emit('message_pinned', payload);
+        } catch (err) {
+            console.error('message:pin error', err);
+        }
+    });
+
+    socket.on('message:save', async (data) => {
+        try {
+            const { messageId, userId, savedCopy } = data || {};
+            if (!messageId || !userId) return;
+            const saved = savedCopy || { messageId, savedBy: userId, savedAt: Date.now() };
+            if (global.savedMessages) {
+                global.savedMessages[userId] = global.savedMessages[userId] || [];
+                global.savedMessages[userId].push(saved);
+            }
+            socket.emit('message_saved', { messageId, userId, saved });
+        } catch (err) {
+            console.error('message:save error', err);
+        }
+    });
+
+    socket.on('message:forward', async (data) => {
+        try {
+            const { toPhone, fromPhone, message, text } = data || {};
+            if (!toPhone || !fromPhone || !message) return;
+            const forwarded = {
+                ...message,
+                sender: fromPhone,
+                recipient: toPhone,
+                roomId: toPhone,
+                text: text || message.text || 'Forwarded message',
+                type: message.type || 'text',
+                timestamp: Date.now(),
+                forwardedFrom: fromPhone,
+                forwarded: true,
+            };
+            const recipientSocketId = onlineUsers[toPhone];
+            if (recipientSocketId) io.to(recipientSocketId).emit('new_private_message', forwarded);
+            socket.emit('new_private_message', forwarded);
+        } catch (err) {
+            console.error('message:forward error', err);
         }
     });
 
