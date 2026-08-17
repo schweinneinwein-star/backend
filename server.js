@@ -62,6 +62,15 @@ if (!cloudinaryConfigured) {
     console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET.');
 }
 
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || null;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || null;
+const TWILIO_PHONE = process.env.TWILIO_PHONE || null;
+const twilioClient = TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
+
+if (!twilioClient) {
+    console.warn('Twilio is not configured. SMS verification will fall back to dev-mode code generation and will not send real SMS until TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_PHONE are set.');
+}
+
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 const pendingCodes = {};
@@ -1807,17 +1816,27 @@ io.on('connection', (socket) => {
         const code = Math.floor(10000 + Math.random() * 90000).toString();
         pendingCodes[phone] = code;
 
+        const sendFallback = () => {
+            console.log(`📱 DEV SMS fallback enabled for ${phone}. Code: ${code}`);
+            socket.emit('code_sent_success');
+        };
+
+        if (!twilioClient || !TWILIO_PHONE) {
+            sendFallback();
+            return;
+        }
+
         twilioClient.messages.create({
             body: `${code} is your Sparkle verification code. Do not share it with anyone.`,
             from: TWILIO_PHONE,
             to: phone
         })
-        .then(message => {
+        .then(() => {
             socket.emit('code_sent_success');
         })
         .catch(error => {
             console.error('❌ Ошибка отправки СМС, включен Fallback:', error);
-            socket.emit('code_sent_success'); 
+            sendFallback();
         });
     });
 
