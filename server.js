@@ -2250,6 +2250,19 @@ socket.on('update_profile', async (data) => {
         }
     });
 
+    socket.on('message:unpin', async (data) => {
+        try {
+            const { messageId, chatId, userId } = data || {};
+            if (!messageId) return;
+            await Message.updateOne({ _id: messageId }, { $set: { isPinned: false, pinnedBy: null, pinnedAt: null } });
+            const payload = { chatId, messageId: String(messageId), userId };
+            if (chatId && onlineUsers[chatId]) io.to(onlineUsers[chatId]).emit('message_unpinned', payload);
+            if (userId && onlineUsers[userId]) io.to(onlineUsers[userId]).emit('message_unpinned', payload);
+        } catch (err) {
+            console.error('message:unpin error', err);
+        }
+    });
+
     socket.on('message:save', async (data) => {
         try {
             const { messageId, userId, savedCopy } = data || {};
@@ -2267,18 +2280,19 @@ socket.on('update_profile', async (data) => {
 
     socket.on('message:forward', async (data) => {
         try {
-            const { toPhone, fromPhone, message, text } = data || {};
-            if (!toPhone || !fromPhone || !message) return;
+            const { toPhone, fromPhone, message, text, isAnonymous, forwardedFromName } = data || {};
+            if (!toPhone || !message) return;
             const forwarded = {
                 ...message,
-                sender: fromPhone,
+                sender: fromPhone || message.sender,
                 recipient: toPhone,
                 roomId: toPhone,
                 text: text || message.text || 'Forwarded message',
                 type: message.type || 'text',
-                timestamp: Date.now(),
-                forwardedFrom: fromPhone,
+                timestamp: data.timestamp ? new Date(data.timestamp) : new Date(),
                 forwarded: true,
+                forwardedFrom: isAnonymous ? null : (forwardedFromName || fromPhone),
+                forwardedAnonymous: !!isAnonymous,
             };
             const recipientSocketId = onlineUsers[toPhone];
             if (recipientSocketId) io.to(recipientSocketId).emit('new_private_message', forwarded);
