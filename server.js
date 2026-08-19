@@ -47,6 +47,36 @@ if (CLOUDINARY_API_KEY) {
 if (CLOUDINARY_API_SECRET) {
     cloudinaryConfig.api_secret = CLOUDINARY_API_SECRET;
 }
+
+// Helper: try to parse CLOUDINARY_URL of form cloudinary://API_KEY:API_SECRET@CLOUD_NAME
+function parseCloudinaryUrl(url) {
+    try {
+        if (!url || typeof url !== 'string') return null;
+        const m = url.match(/^cloudinary:\/\/(.+?):(.+?)@(.+)$/i);
+        if (!m) return null;
+        return {
+            api_key: m[1],
+            api_secret: m[2],
+            cloud_name: m[3],
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+// If CLOUDINARY_URL provided but individual keys are missing, try parsing it for api_key/api_secret/cloud_name
+if (CLOUDINARY_URL && (!cloudinaryConfig.api_key || !cloudinaryConfig.api_secret || !cloudinaryConfig.cloud_name)) {
+    const parsed = parseCloudinaryUrl(CLOUDINARY_URL);
+    if (parsed) {
+        cloudinaryConfig.api_key = cloudinaryConfig.api_key || parsed.api_key;
+        cloudinaryConfig.api_secret = cloudinaryConfig.api_secret || parsed.api_secret;
+        cloudinaryConfig.cloud_name = cloudinaryConfig.cloud_name || parsed.cloud_name;
+        console.log('Parsed CLOUDINARY_URL into api_key/cloud_name (partial):', { cloud_name: !!parsed.cloud_name, api_key: !!parsed.api_key });
+    } else {
+        console.log('CLOUDINARY_URL provided but could not parse it to extract api_key/api_secret/cloud_name; ensure it uses cloudinary://API_KEY:API_SECRET@CLOUD_NAME format');
+    }
+}
+
 cloudinary.config(cloudinaryConfig);
 
 const cloudinaryRuntimeConfig = cloudinary.config();
@@ -59,7 +89,12 @@ console.log('Cloudinary config status:', {
 });
 
 if (!cloudinaryConfigured) {
-    console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fail without CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET.');
+    console.warn('Cloudinary environment variables are not fully configured. File upload endpoint will fall back to local save unless CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET are set.');
+} else {
+    // Additional runtime check
+    if (!cloudinaryRuntimeConfig.api_key || !cloudinaryRuntimeConfig.api_secret || !cloudinaryRuntimeConfig.cloud_name) {
+        console.warn('Cloudinary appears partially configured. Uploads may fail. Runtime config:', { cloud_name: cloudinaryRuntimeConfig.cloud_name, api_key: !!cloudinaryRuntimeConfig.api_key, api_secret: !!cloudinaryRuntimeConfig.api_secret });
+    }
 }
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || null;
@@ -91,7 +126,11 @@ async function uploadBufferToCloudinary(file) {
     const runtimeConfig = cloudinary.config();
     const hasKeys = !!runtimeConfig.api_key && !!runtimeConfig.api_secret && !!runtimeConfig.cloud_name;
     if (!hasKeys) {
-        throw new Error('Cloudinary upload failed: incomplete Cloudinary runtime configuration.');
+        // provide a richer error message to help diagnostics
+        const msg = `Cloudinary upload failed: incomplete runtime configuration. runtimeConfig: ${JSON.stringify({ cloud_name: runtimeConfig.cloud_name ? true : false, api_key: runtimeConfig.api_key ? true : false, api_secret: runtimeConfig.api_secret ? true : false })}`;
+        const err = new Error(msg);
+        err.runtimeConfig = runtimeConfig;
+        throw err;
     }
 
     return new Promise((resolve, reject) => {
@@ -103,13 +142,20 @@ async function uploadBufferToCloudinary(file) {
             },
             (error, result) => {
                 if (error) {
+                    // include better context in logs
+                    console.error('Cloudinary uploader returned error:', error && (error.message || error));
                     return reject(error);
                 }
                 resolve(result);
             }
         );
 
-        uploadStream.end(file.buffer);
+        try {
+            uploadStream.end(file.buffer);
+        } catch (e) {
+            console.error('Failed to end upload stream for Cloudinary:', e);
+            reject(e);
+        }
     });
 }
 
@@ -299,6 +345,7 @@ const uploadFileSchema = new mongoose.Schema({
     resourceType: { type: String, required: true },
     originalName: { type: String, required: true },
     size: { type: Number, required: true },
+    source: { type: String, default: 'cloudinary' }, // 'cloudinary' or 'local'
     createdAt: { type: Date, default: Date.now },
 }, { timestamps: true });
 
@@ -646,6 +693,7 @@ async function handleFileUpload(req, res) {
                 resourceType,
                 originalName,
                 size,
+                source: source || 'cloudinary',
             });
             savedFiles.push(savedFile);
         }
